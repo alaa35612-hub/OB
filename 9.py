@@ -1721,18 +1721,26 @@ class SmartMoneyAlgoProE5:
                     if not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
-                        events[key] = {
-                            "text": bx.text,
-                            "price": (bx.bottom, bx.top),
-                            "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
-                            "time": bx.left,
-                            "time_display": format_timestamp(bx.left),
-                            "status": events.get(key, {}).get("status", "active"),
-                            "status_display": events.get(key, {}).get(
+                        existing = events.get(key, {})
+                        payload = dict(existing)
+                        payload.setdefault("text", bx.text)
+                        if "price" not in payload or payload.get("price") in (None, (None, None)):
+                            payload["price"] = (bx.bottom, bx.top)
+                        if "display" not in payload or not payload.get("display"):
+                            payload["display"] = (
+                                f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}"
+                            )
+                        if "time" not in payload or not isinstance(payload.get("time"), (int, float)):
+                            payload["time"] = bx.left
+                        payload["time_display"] = format_timestamp(payload.get("time"))
+                        if "status" not in payload:
+                            payload["status"] = existing.get("status", "active")
+                        if "status_display" not in payload:
+                            payload["status_display"] = existing.get(
                                 "status_display",
                                 self.BOX_STATUS_LABELS.get("active", "active"),
-                            ),
-                        }
+                            )
+                        events[key] = payload
                         return
 
         bull_color = self.inputs.structure.bull
