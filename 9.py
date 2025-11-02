@@ -1746,6 +1746,55 @@ class SmartMoneyAlgoProE5:
         bull_color = self.inputs.structure.bull
         bear_color = self.inputs.structure.bear
 
+        def merge_active_box(
+            key: str,
+            box: Optional[Box],
+            *,
+            fallback_text: str,
+        ) -> None:
+            if not isinstance(box, Box):
+                return
+            text = box.text.strip() or fallback_text
+            existing = events.get(key, {}).copy()
+            existing.setdefault("text", text)
+            price_tuple = (box.bottom, box.top)
+            existing["price"] = price_tuple
+            display = existing.get("display")
+            if not display:
+                display = f"{text} {format_price(price_tuple[0])} → {format_price(price_tuple[1])}"
+            existing["display"] = display
+            ts_candidates: List[int] = []
+            current_time = existing.get("time")
+            if isinstance(current_time, (int, float)):
+                ts_candidates.append(int(current_time))
+            for candidate in (box.right, box.left):
+                if isinstance(candidate, (int, float)):
+                    ts_candidates.append(int(candidate))
+            valid_time: Optional[int] = None
+            for candidate in ts_candidates:
+                if self._console_event_within_age(candidate):
+                    valid_time = candidate
+                    break
+            if valid_time is None:
+                return
+            existing["time"] = valid_time
+            existing["time_display"] = format_timestamp(valid_time)
+            if "status" not in existing or "status_display" not in existing:
+                status = existing.get("status")
+                status_display = existing.get("status_display")
+                if not status or not status_display:
+                    log_entry = self.console_event_log.get(key, {})
+                    if isinstance(log_entry, dict):
+                        status = status or log_entry.get("status")
+                        status_display = status_display or log_entry.get("status_display")
+                if status and not status_display:
+                    status_display = self.BOX_STATUS_LABELS.get(status, status)
+                if status:
+                    existing["status"] = status
+                if status_display:
+                    existing["status_display"] = status_display
+            events[key] = existing
+
         def _text_equals(label: Label, target: str, *, allow_hyphen: bool = False) -> bool:
             text = label.text.strip()
             if not allow_hyphen and "-" in text:
@@ -1796,6 +1845,9 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+        merge_active_box("EXT_OB", getattr(self, "lstBx", None), fallback_text="EXT OB")
+        merge_active_box("IDM_OB", getattr(self, "lstBxIdm", None), fallback_text="IDM OB")
 
         return events
 
