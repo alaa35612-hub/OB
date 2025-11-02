@@ -6222,7 +6222,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.demandZone.get(i)
                 if (
                     self.demandZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.top <= lstPrs)
+                    and (lstPrs is None or bx.top > lstPrs)
                     and bx.top <= y
                     and bx.bottom >= (self.lstHlPrsIdm if not math.isnan(self.lstHlPrsIdm) else -math.inf)
                 ):
@@ -6248,7 +6248,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.supplyZone.get(i)
                 if (
                     self.supplyZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.bottom >= lstPrs)
+                    and (lstPrs is None or bx.bottom < lstPrs)
                     and bx.bottom >= y
                     and bx.top <= (self.lstHlPrsIdm if not math.isnan(self.lstHlPrsIdm) else math.inf)
                 ):
@@ -6330,7 +6330,7 @@ class SmartMoneyAlgoProE5:
                 bx = self.supplyZone.get(i)
                 cond = (
                     self.supplyZoneIsMit.get(i) == 0
-                    and (lstPrs is None or bx.top >= lstPrs)
+                    and (lstPrs is None or bx.top > lstPrs)
                     and bx.bottom >= y
                     and bx.top <= (self.lstHlPrs if not math.isnan(self.lstHlPrs) else math.inf)
                 )
