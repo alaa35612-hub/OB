@@ -1633,6 +1633,8 @@ class SmartMoneyAlgoProE5:
         elif text == "Golden zone":
             key = "GOLDEN_ZONE"
         if key:
+            if status == "new" and not isinstance(event_time, int):
+                event_time = self.series.get_time()
             ts = event_time if isinstance(event_time, int) else box.left
             status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
