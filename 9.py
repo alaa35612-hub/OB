@@ -142,14 +142,16 @@ class BinanceSymbolSelectorConfig:
     # user supplies the preferred threshold, timeframe scope, and candle
     # window explicitly when they wish to enable the filter.
 
-    prioritize_top_gainers: bool = True
+    prioritize_top_gainers: bool = False
     top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
     top_gainer_threshold: Optional[float] = None
     top_gainer_scope: Optional[str] = None
     top_gainer_candle_window: Optional[int] = None
 
 
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
+    prioritize_top_gainers=False
+)
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -1368,6 +1370,7 @@ class SmartMoneyAlgoProE5:
         self.last_liq_low_time: Optional[int] = None
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
+        self.isb_history: List[bool] = []
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -2411,6 +2414,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
         self.motherBar_history: List[int] = [self.motherBar]
+        self.isb_history: List[bool] = []
 
         self.initialised = True
         self.time_history = [time_val]
@@ -6549,24 +6553,29 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     def handleZone(self, zoneArray: PineArray, zoneArrayisMit: PineArray, left: int, top: float, bot: float, color: str, isBull: bool) -> None:
         zone = self.getNLastValue(zoneArray, 1)
+        should_create = True
         if isinstance(zone, Box):
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
-            rangeTop = abs(top - topZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
-            rangeBot = abs(bot - botZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
+            denominator = max(topZone - botZone, 1e-9)
+            rangeTop = abs(top - topZone) / denominator < self.mergeRatio
+            rangeBot = abs(bot - botZone) / denominator < self.mergeRatio
             if (top >= topZone and bot <= botZone) or rangeTop or rangeBot:
                 top = max(top, topZone)
                 bot = min(bot, botZone)
                 left = leftZone
                 self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
-        box_obj = self.createBox(
-            left,
-            self.series.get_time(),
-            top,
-            bot,
-            color,
-        )
-        zoneArray.push(box_obj)
-        zoneArrayisMit.push(0)
+            if top <= topZone and bot >= botZone:
+                should_create = False
+        if should_create:
+            box_obj = self.createBox(
+                left,
+                self.series.get_time(),
+                top,
+                bot,
+                color,
+            )
+            zoneArray.push(box_obj)
+            zoneArrayisMit.push(0)
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6742,6 +6751,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history.append(self.motherHigh)
         self.motherLow_history.append(self.motherLow)
         self.motherBar_history.append(self.motherBar)
+        self.isb_history.append(bool(isb))
 
         # Top/bottom history -------------------------------------------------
         top = self.getNLastValue(self.arrTop, 1)
@@ -7119,7 +7129,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBS = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
@@ -7157,7 +7171,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBD = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
@@ -7354,6 +7372,32 @@ def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
     return core
 
 
+def _binance_linear_symbol_from_id(symbol: str) -> Optional[str]:
+    """Normalise Binance linear contract identifiers to ccxt symbols."""
+
+    if not symbol or not isinstance(symbol, str):
+        return None
+    token = symbol.strip().upper()
+    if not token:
+        return None
+
+    # Split explicit ``BASE/QUOTE:SCOPE`` or ``BASEQUOTESCOPE`` representations.
+    if ":" in token:
+        lhs, rhs = token.split(":", 1)
+    else:
+        lhs, rhs = token, None
+
+    if rhs is None and lhs.endswith("USDT"):
+        rhs = "USDT"
+
+    if "/" not in lhs and lhs.endswith("USDT"):
+        base = lhs[:-4]
+        lhs = f"{base}/USDT"
+
+    normalized = f"{lhs}:{rhs}" if rhs else lhs
+    return normalized or None
+
+
 def _bulk_fetch_recent_ohlcv(
     exchange: Any,
     symbols: Sequence[str],
@@ -7479,10 +7523,20 @@ def _binance_pick_symbols(
         except Exception as exc:
             print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
             return BinanceSymbolSelection([], [], False, False)
-        valid = [symbol for symbol in requested if symbol in markets]
-        invalid = sorted(set(requested) - set(valid))
+        valid: List[str] = []
+        invalid: List[str] = []
+        for symbol in requested:
+            if symbol in markets:
+                valid.append(symbol)
+                continue
+            canonical = _binance_linear_symbol_from_id(symbol)
+            if canonical and canonical in markets:
+                valid.append(canonical)
+            else:
+                invalid.append(symbol)
         if invalid:
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+            invalid_sorted = sorted(dict.fromkeys(invalid))
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
     try:
@@ -9517,6 +9571,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 ts_s = "—"
             colored_title = _colorize_directional_text(title)
             print(f"- {name}: {ts_s} UTC  |  {colored_title}")
+
+    market_report = _build_market_trend_report(runtime)
+    print("\n🎯 تقرير اتجاه السوق (Market Trend)")
+    print(json.dumps(market_report, ensure_ascii=False, indent=2))
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
@@ -9910,6 +9968,10 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             colored_title = _colorize_directional_text(title)
             print(f"- {name}: {ts_s} UTC  |  {colored_title}")
 
+    market_report = _build_market_trend_report(runtime)
+    print("\n🎯 تقرير اتجاه السوق (Market Trend)")
+    print(json.dumps(market_report, ensure_ascii=False, indent=2))
+
 # ---------- Live exchange helpers (Futures-only) ----------
 def _build_exchange(_market_forced_usdtm:str="usdtm"):
     return ccxt.binanceusdm({"enableRateLimit": True})
@@ -10213,16 +10275,27 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
     else:
         scope = None
 
+    candle_window_hint = getattr(
+        cfg,
+        "height_candle_window",
+        DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+    )
+
+    try:
+        candle_window_value = int(candle_window_hint) if candle_window_hint is not None else None
+    except (TypeError, ValueError):
+        candle_window_value = None
+    if candle_window_value is not None and candle_window_value <= 0:
+        candle_window_value = None
+
+    prioritize = bool(threshold is not None and scope and candle_window_value)
+
     selector = BinanceSymbolSelectorConfig(
-        prioritize_top_gainers=DEFAULT_BINANCE_SYMBOL_SELECTOR.prioritize_top_gainers,
+        prioritize_top_gainers=prioritize,
         top_gainer_metric=metric,
         top_gainer_threshold=threshold,
         top_gainer_scope=scope,
-        top_gainer_candle_window=getattr(
-            cfg,
-            "height_candle_window",
-            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
-        ),
+        top_gainer_candle_window=candle_window_value,
     )
 
     selection = _binance_pick_symbols(
@@ -10421,7 +10494,6 @@ if __name__ == "__main__":
 - يدعم CSV أو ccxt (إن توفر) للفحص التاريخي 2022-01-01 → 2023-12-31 أو الوضع الحي.
 """
 
-from __future__ import annotations
 import argparse, csv, os, sys, math, time
 import datetime as dt
 from dataclasses import dataclass
@@ -10466,8 +10538,19 @@ def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
                       since_ms: int, until_ms: int, limit: int = 1000) -> List[Dict[str, float]]:
     out: List[Dict[str, float]] = []
     since = since_ms
+    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
     while True:
-        batch = exchange.fetch_ohlcv(f"{symbol}:USDT", timeframe=timeframe, since=since, limit=limit)
+        try:
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
+        except Exception as exc:
+            if ccxt is None or not isinstance(exc, getattr(ccxt, "BaseError", Exception)):
+                raise
+            # حاول مجددًا باستخدام معرّف REST "BTCUSDT" إن أمكن
+            fallback = _binance_linear_symbol_id(normalized_symbol)
+            if not fallback:
+                raise
+            normalized_symbol = fallback
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
         if not batch:
             break
         for t, o, h, l, c, v in batch:
@@ -10631,6 +10714,140 @@ def _swept_against_pdh_pdl(rt: Any) -> Optional[str]:
     if pdl is not None and pc >= pdl and lc < pdl:
         return "down"
     return None
+
+
+def _event_timestamp(payload: Any) -> Optional[int]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("time", "ts", "timestamp"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)):
+            ts = int(value)
+            if ts > 0:
+                return ts
+    return None
+
+
+def _zone_price_tuple(value: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(value, dict):
+        value = value.get("price")
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            lo = float(value[0])
+            hi = float(value[1])
+        except (TypeError, ValueError):
+            return None
+        if not math.isnan(lo) and not math.isnan(hi):
+            if lo > hi:
+                lo, hi = hi, lo
+            return lo, hi
+    return None
+
+
+def _mid_price(runtime: Any) -> Optional[float]:
+    hi = getattr(runtime, "lastH", None)
+    lo = getattr(runtime, "lastL", None)
+    try:
+        if hi is None or lo is None:
+            return None
+        hi_f = float(hi)
+        lo_f = float(lo)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(hi_f) or math.isnan(lo_f):
+        return None
+    return (hi_f + lo_f) / 2.0
+
+
+def _strong_body_candle(runtime: Any, bullish: bool) -> bool:
+    close = _series_get(runtime, "close", 0)
+    open_ = _series_get(runtime, "open", 0)
+    high = _series_get(runtime, "high", 0)
+    low = _series_get(runtime, "low", 0)
+    if any(math.isnan(v) for v in (close, open_, high, low)):
+        return False
+    if bullish and not (close > open_):
+        return False
+    if not bullish and not (close < open_):
+        return False
+    body = abs(close - open_)
+    rng = max(high - low, 1e-9)
+    return body / rng >= 0.5
+
+
+def _format_market_timestamp(ts_ms: int) -> str:
+    if not isinstance(ts_ms, int) or ts_ms <= 0:
+        return "—"
+    dt_obj = datetime.datetime.utcfromtimestamp(ts_ms / 1000.0)
+    return dt_obj.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _build_market_trend_report(runtime: Any) -> Dict[str, Any]:
+    events = _extract_events(runtime)
+    trend: Optional[str] = None
+    trend_ts = -1
+
+    def _consider(key: str) -> None:
+        nonlocal trend, trend_ts
+        direction = _dir_from(events, key)
+        if direction not in ("bullish", "bearish"):
+            return
+        ts = _event_timestamp(events.get(key)) or -1
+        label = "Bullish" if direction == "bullish" else "Bearish"
+        if ts >= trend_ts:
+            trend = label
+            trend_ts = ts
+
+    _consider("BOS")
+    _consider("CHOCH")
+
+    mid_price = _mid_price(runtime)
+    poi_zones: List[str] = []
+    poi_details: List[Tuple[str, Tuple[float, float], Optional[int]]] = []
+    for key, label in (("EXT_OB", "EXT OB"), ("IDM_OB", "IDM OB")):
+        zone = events.get(key, {})
+        price_tuple = _zone_price_tuple(zone)
+        if not price_tuple:
+            continue
+        lo, hi = price_tuple
+        zone_mid = (lo + hi) / 2.0
+        include = True
+        if mid_price is not None and trend == "Bullish":
+            include = zone_mid <= mid_price + 1e-9
+        elif mid_price is not None and trend == "Bearish":
+            include = zone_mid >= mid_price - 1e-9
+        if include:
+            poi_details.append((label, (lo, hi), _event_timestamp(zone)))
+
+    poi_details.sort(key=lambda item: item[2] or 0, reverse=True)
+    for label, (lo, hi), _ in poi_details[:2]:
+        poi_zones.append(f"{label} {format_price(lo)} → {format_price(hi)}")
+
+    price = _series_get(runtime, "close", 0)
+    entry_signal = "No entry signal"
+    if not math.isnan(price) and poi_details:
+        for label, (lo, hi), _ in poi_details:
+            if lo <= price <= hi:
+                direction = "Buy" if trend == "Bullish" else "Sell"
+                entry_signal = f"{direction} entry (direct) inside {label}"
+                break
+
+    if entry_signal == "No entry signal" and trend in ("Bullish", "Bearish"):
+        sweep = _swept_against_pdh_pdl(runtime)
+        wants_bull = trend == "Bullish"
+        strong = _strong_body_candle(runtime, wants_bull)
+        if wants_bull and sweep == "down" and strong:
+            entry_signal = "Buy confirmed after liquidity sweep"
+        elif not wants_bull and sweep == "up" and strong:
+            entry_signal = "Sell confirmed after liquidity sweep"
+
+    report = {
+        "Market_Trend": trend or "Neutral",
+        "POI_Zones": poi_zones,
+        "Entry_Signal": entry_signal,
+        "Timestamp": _format_market_timestamp(_last_time(runtime)),
+    }
+    return report
 
 
 class _StrategyEngine:
