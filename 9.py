@@ -6907,15 +6907,44 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     def handleZone(self, zoneArray: PineArray, zoneArrayisMit: PineArray, left: int, top: float, bot: float, color: str, isBull: bool) -> None:
         zone = self.getNLastValue(zoneArray, 1)
+
+        def _is_num(value: Any) -> bool:
+            return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+        topZone = botZone = NA
+        leftZone = left
         if isinstance(zone, Box):
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
-            rangeTop = abs(top - topZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
-            rangeBot = abs(bot - botZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
-            if (top >= topZone and bot <= botZone) or rangeTop or rangeBot:
-                top = max(top, topZone)
-                bot = min(bot, botZone)
-                left = leftZone
-                self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
+
+        height = topZone - botZone if _is_num(topZone) and _is_num(botZone) else NA
+        merge_with_previous = False
+
+        if isinstance(zone, Box) and _is_num(top) and _is_num(bot):
+            if _is_num(topZone) and _is_num(botZone):
+                if top >= topZone and bot <= botZone:
+                    merge_with_previous = True
+                if _is_num(height) and height != 0:
+                    ratio_top = abs(top - topZone) / abs(height)
+                    ratio_bot = abs(bot - botZone) / abs(height)
+                    if ratio_top < self.mergeRatio or ratio_bot < self.mergeRatio:
+                        merge_with_previous = True
+
+        if merge_with_previous and isinstance(zone, Box):
+            top = max(top, topZone)
+            bot = min(bot, botZone)
+            left = leftZone
+            self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
+
+        contains_previous = False
+        if isinstance(zone, Box) and _is_num(top) and _is_num(bot) and _is_num(topZone) and _is_num(botZone):
+            contains_previous = top <= topZone and bot >= botZone
+
+        if contains_previous:
+            return
+
+        if not (_is_num(top) and _is_num(bot)):
+            return
+
         box_obj = self.createBox(
             left,
             self.series.get_time(),
