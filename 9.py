@@ -149,7 +149,9 @@ class BinanceSymbolSelectorConfig:
     top_gainer_candle_window: Optional[int] = None
 
 
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
+    prioritize_top_gainers=False
+)
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -7370,6 +7372,20 @@ def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
     return core
 
 
+def _binance_linear_symbol_from_id(symbol: str) -> Optional[str]:
+    """Normalise Binance linear contract identifiers to ccxt symbols."""
+
+    if not symbol or not isinstance(symbol, str):
+        return None
+    token = symbol.strip().upper()
+    if "/" in token or ":" in token:
+        return token
+    if token.endswith("USDT") and len(token) > 4:
+        base = token[:-4]
+        return f"{base}/USDT:USDT"
+    return token or None
+
+
 def _bulk_fetch_recent_ohlcv(
     exchange: Any,
     symbols: Sequence[str],
@@ -7495,10 +7511,20 @@ def _binance_pick_symbols(
         except Exception as exc:
             print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
             return BinanceSymbolSelection([], [], False, False)
-        valid = [symbol for symbol in requested if symbol in markets]
-        invalid = sorted(set(requested) - set(valid))
+        valid: List[str] = []
+        invalid: List[str] = []
+        for symbol in requested:
+            if symbol in markets:
+                valid.append(symbol)
+                continue
+            canonical = _binance_linear_symbol_from_id(symbol)
+            if canonical and canonical in markets:
+                valid.append(canonical)
+            else:
+                invalid.append(symbol)
         if invalid:
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+            invalid_sorted = sorted(dict.fromkeys(invalid))
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
     try:
@@ -10481,8 +10507,19 @@ def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
                       since_ms: int, until_ms: int, limit: int = 1000) -> List[Dict[str, float]]:
     out: List[Dict[str, float]] = []
     since = since_ms
+    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
     while True:
-        batch = exchange.fetch_ohlcv(f"{symbol}:USDT", timeframe=timeframe, since=since, limit=limit)
+        try:
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
+        except Exception as exc:
+            if ccxt is None or not isinstance(exc, getattr(ccxt, "BaseError", Exception)):
+                raise
+            # حاول مجددًا باستخدام معرّف REST "BTCUSDT" إن أمكن
+            fallback = _binance_linear_symbol_id(normalized_symbol)
+            if not fallback:
+                raise
+            normalized_symbol = fallback
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
         if not batch:
             break
         for t, o, h, l, c, v in batch:
