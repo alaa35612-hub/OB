@@ -10437,7 +10437,6 @@ if __name__ == "__main__":
 - يدعم CSV أو ccxt (إن توفر) للفحص التاريخي 2022-01-01 → 2023-12-31 أو الوضع الحي.
 """
 
-from __future__ import annotations
 import argparse, csv, os, sys, math, time
 import datetime as dt
 from dataclasses import dataclass
