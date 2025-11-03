@@ -3201,6 +3201,37 @@ class SmartMoneyAlgoProE5:
     def _timediff(self) -> float:
         return self.timediff_value if self.timediff_value > 0 else float(self.curTf)
 
+    def _estimate_security_timedelta(self, key: str) -> float:
+        feed = self.security_series.get(key)
+        if feed is None:
+            return self._timediff()
+        times = list(feed.final_time)
+        pending = feed.pending
+        if pending is not None:
+            pending_time = int(pending.get("time", 0))
+            if times:
+                last_time = times[-1]
+                diff = pending_time - last_time
+                if diff > 0:
+                    return float(diff)
+            else:
+                seconds = feed.timeframe_seconds or 0
+                if seconds > 0:
+                    return float(seconds * 1000)
+        if len(times) > 101:
+            diff = times[-1] - times[-101]
+            if diff > 0:
+                return diff / 100.0
+        if len(times) > 1:
+            diff = times[-1] - times[-2]
+            if diff > 0:
+                return float(diff)
+        if len(times) == 1:
+            seconds = feed.timeframe_seconds or 0
+            if seconds > 0:
+                return float(seconds * 1000)
+        return self._timediff()
+
     def _extend_time(self, length: int) -> int:
         return int(self.series.get_time() + self._timediff() * length)
 
@@ -4504,6 +4535,7 @@ class SmartMoneyAlgoProE5:
         percent_text: bool,
         show_line: bool,
         line_style: str,
+        left_shift_bars: Optional[int] = None,
     ) -> None:
         seconds = _parse_timeframe_to_seconds(timeframe, self.base_tf_seconds)
         key = self._security_key(timeframe, seconds)
@@ -4530,10 +4562,18 @@ class SmartMoneyAlgoProE5:
         )
         prev_valid = self.ob_valid_history.get(key, False)
         self.ob_valid_history[key] = valid
+        if left_shift_bars:
+            shift = max(left_shift_bars, 0)
+            if shift > 0:
+                tf_delta = self._estimate_security_timedelta(key)
+                left_override = int(self.series.get_time() - tf_delta * shift)
+                if left_override < 0:
+                    left_override = 0
+                left_val = left_override
         if valid and not prev_valid:
             top_arr.unshift(top_val)
             btm_arr.unshift(bottom_val)
-            left_arr.unshift(left_val)
+            left_arr.unshift(int(left_val))
             type_arr.unshift(type_val)
             vol_arr.unshift(volume_)
             buy_arr.unshift(b_volume)
@@ -4632,6 +4672,7 @@ class SmartMoneyAlgoProE5:
                     ds.percent_text_2,
                     ds.show_line_ob_2,
                     ds.line_style_ob_2,
+                    left_shift_bars=5,
                 )
 
         self._apply_order_block_filters()
