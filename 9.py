@@ -149,7 +149,9 @@ class BinanceSymbolSelectorConfig:
     top_gainer_candle_window: Optional[int] = None
 
 
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
+    prioritize_top_gainers=False
+)
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -1368,6 +1370,7 @@ class SmartMoneyAlgoProE5:
         self.last_liq_low_time: Optional[int] = None
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
+        self.isb_history: List[bool] = []
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -2411,6 +2414,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
         self.motherBar_history: List[int] = [self.motherBar]
+        self.isb_history: List[bool] = []
 
         self.initialised = True
         self.time_history = [time_val]
@@ -6549,24 +6553,29 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     def handleZone(self, zoneArray: PineArray, zoneArrayisMit: PineArray, left: int, top: float, bot: float, color: str, isBull: bool) -> None:
         zone = self.getNLastValue(zoneArray, 1)
+        should_create = True
         if isinstance(zone, Box):
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
-            rangeTop = abs(top - topZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
-            rangeBot = abs(bot - botZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
+            denominator = max(topZone - botZone, 1e-9)
+            rangeTop = abs(top - topZone) / denominator < self.mergeRatio
+            rangeBot = abs(bot - botZone) / denominator < self.mergeRatio
             if (top >= topZone and bot <= botZone) or rangeTop or rangeBot:
                 top = max(top, topZone)
                 bot = min(bot, botZone)
                 left = leftZone
                 self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
-        box_obj = self.createBox(
-            left,
-            self.series.get_time(),
-            top,
-            bot,
-            color,
-        )
-        zoneArray.push(box_obj)
-        zoneArrayisMit.push(0)
+            if top <= topZone and bot >= botZone:
+                should_create = False
+        if should_create:
+            box_obj = self.createBox(
+                left,
+                self.series.get_time(),
+                top,
+                bot,
+                color,
+            )
+            zoneArray.push(box_obj)
+            zoneArrayisMit.push(0)
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6742,6 +6751,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history.append(self.motherHigh)
         self.motherLow_history.append(self.motherLow)
         self.motherBar_history.append(self.motherBar)
+        self.isb_history.append(bool(isb))
 
         # Top/bottom history -------------------------------------------------
         top = self.getNLastValue(self.arrTop, 1)
@@ -7119,7 +7129,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBS = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
@@ -7157,7 +7171,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBD = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
@@ -7354,6 +7372,20 @@ def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
     return core
 
 
+def _binance_linear_symbol_from_id(symbol: str) -> Optional[str]:
+    """Normalise Binance linear contract identifiers to ccxt symbols."""
+
+    if not symbol or not isinstance(symbol, str):
+        return None
+    token = symbol.strip().upper()
+    if "/" in token or ":" in token:
+        return token
+    if token.endswith("USDT") and len(token) > 4:
+        base = token[:-4]
+        return f"{base}/USDT:USDT"
+    return token or None
+
+
 def _bulk_fetch_recent_ohlcv(
     exchange: Any,
     symbols: Sequence[str],
@@ -7479,10 +7511,20 @@ def _binance_pick_symbols(
         except Exception as exc:
             print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
             return BinanceSymbolSelection([], [], False, False)
-        valid = [symbol for symbol in requested if symbol in markets]
-        invalid = sorted(set(requested) - set(valid))
+        valid: List[str] = []
+        invalid: List[str] = []
+        for symbol in requested:
+            if symbol in markets:
+                valid.append(symbol)
+                continue
+            canonical = _binance_linear_symbol_from_id(symbol)
+            if canonical and canonical in markets:
+                valid.append(canonical)
+            else:
+                invalid.append(symbol)
         if invalid:
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+            invalid_sorted = sorted(dict.fromkeys(invalid))
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
     try:
@@ -10421,7 +10463,6 @@ if __name__ == "__main__":
 - يدعم CSV أو ccxt (إن توفر) للفحص التاريخي 2022-01-01 → 2023-12-31 أو الوضع الحي.
 """
 
-from __future__ import annotations
 import argparse, csv, os, sys, math, time
 import datetime as dt
 from dataclasses import dataclass
@@ -10466,8 +10507,19 @@ def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
                       since_ms: int, until_ms: int, limit: int = 1000) -> List[Dict[str, float]]:
     out: List[Dict[str, float]] = []
     since = since_ms
+    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
     while True:
-        batch = exchange.fetch_ohlcv(f"{symbol}:USDT", timeframe=timeframe, since=since, limit=limit)
+        try:
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
+        except Exception as exc:
+            if ccxt is None or not isinstance(exc, getattr(ccxt, "BaseError", Exception)):
+                raise
+            # حاول مجددًا باستخدام معرّف REST "BTCUSDT" إن أمكن
+            fallback = _binance_linear_symbol_id(normalized_symbol)
+            if not fallback:
+                raise
+            normalized_symbol = fallback
+            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
         if not batch:
             break
         for t, o, h, l, c, v in batch:
