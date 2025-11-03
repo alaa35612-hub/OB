@@ -6907,6 +6907,7 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     def handleZone(self, zoneArray: PineArray, zoneArrayisMit: PineArray, left: int, top: float, bot: float, color: str, isBull: bool) -> None:
         zone = self.getNLastValue(zoneArray, 1)
+        should_create = True
         if isinstance(zone, Box):
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
             rangeTop = abs(top - topZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
@@ -6916,6 +6917,10 @@ class SmartMoneyAlgoProE5:
                 bot = min(bot, botZone)
                 left = leftZone
                 self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
+            elif top <= topZone and bot >= botZone:
+                should_create = False
+        if not should_create:
+            return
         box_obj = self.createBox(
             left,
             self.series.get_time(),
