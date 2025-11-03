@@ -760,10 +760,19 @@ class OrderBlockInputs:
     poi_type: str = "Mother Bar"
     colorSupply: str = "#cd5c4800"
     colorDemand: str = "#2f825f00"
+    strong_supply_color: str = "#c6282860"
+    strong_demand_color: str = "#1b5e2060"
+    neutral_supply_color: str = "#cd5c4840"
+    neutral_demand_color: str = "#2f825f40"
+    weak_supply_color: str = "#5d606b30"
+    weak_demand_color: str = "#5d606b30"
+    ob_text_color_1: str = "color.new(#787b86, 0)"
     colorMitigated: str = "#c0c0c000"
     showSCOB: bool = True
     scobUp: str = "#0b3ff9"
     scobDn: str = "#da781d"
+    alerts_for_neutral: bool = False
+    alerts_for_weak: bool = False
 
 
 @dataclass
@@ -1424,7 +1433,13 @@ class SmartMoneyAlgoProE5:
     def _archive_box(self, box: Optional[Box], hist_text: str, store: PineArray) -> None:
         if not isinstance(box, Box):
             return
-        box.set_text(hist_text)
+        meta = self._get_zone_meta(box)
+        if meta is not None:
+            meta["base_text"] = hist_text
+            meta["is_historical"] = True
+            self._recalculate_zone_strength(box, meta, historical=True)
+        else:
+            box.set_text(hist_text)
         if box in self.boxes:
             self.boxes.remove(box)
         store.push(box)
@@ -1620,7 +1635,7 @@ class SmartMoneyAlgoProE5:
         }
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
-        text = box.text.strip()
+        text = self._zone_base_text(box)
         key: Optional[str] = None
         if text == "IDM OB":
             key = "IDM_OB"
@@ -1640,6 +1655,12 @@ class SmartMoneyAlgoProE5:
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
+            strength = None
+            meta = self._get_zone_meta(box)
+            if meta is not None:
+                strength = meta.get("strength")
+                if strength:
+                    strength = strength.lower()
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
@@ -1649,6 +1670,8 @@ class SmartMoneyAlgoProE5:
                 "status": status,
                 "status_display": status_label,
             }
+            if strength:
+                self.console_event_log[key]["strength"] = strength
             self._trace(
                 "box",
                 "register",
@@ -1754,7 +1777,7 @@ class SmartMoneyAlgoProE5:
         ) -> None:
             if not isinstance(box, Box):
                 return
-            text = box.text.strip() or fallback_text
+            text = self._zone_base_text(box) or fallback_text
             existing = events.get(key, {}).copy()
             existing.setdefault("text", text)
             price_tuple = (box.bottom, box.top)
@@ -1832,16 +1855,16 @@ class SmartMoneyAlgoProE5:
             lambda lbl: f"صعود @ {format_price(lbl.y)}",
         )
 
-        record_box("IDM_OB", lambda bx: bx.text == "IDM OB")
-        record_box("EXT_OB", lambda bx: bx.text == "EXT OB")
+        record_box("IDM_OB", lambda bx: self._zone_text_matches(bx, "IDM OB"))
+        record_box("EXT_OB", lambda bx: self._zone_text_matches(bx, "EXT OB"))
         record_box(
             "HIST_IDM_OB",
-            lambda bx: bx.text == "Hist IDM OB",
+            lambda bx: self._zone_text_matches(bx, "Hist IDM OB"),
             sources=(self.hist_idm_boxes, self.boxes),
         )
         record_box(
             "HIST_EXT_OB",
-            lambda bx: bx.text == "Hist EXT OB",
+            lambda bx: self._zone_text_matches(bx, "Hist EXT OB"),
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
@@ -2424,6 +2447,16 @@ class SmartMoneyAlgoProE5:
         self.lstBx: Optional[Box] = None
 
         self.lstHlPrs_history: List[float] = []
+
+        self.ob_metadata: Dict[int, Dict[str, Any]] = {}
+        self._ob_killzone_windows: Tuple[Tuple[float, float], ...] = (
+            (7.0, 10.0),
+            (13.0, 16.0),
+        )
+        self._ob_quiet_windows: Tuple[Tuple[float, float], ...] = (
+            (0.0, 3.0),
+            (21.0, 24.0),
+        )
 
         self.mergeRatio = 0.1
         self.maxBarHistory = 2000
@@ -5749,6 +5782,7 @@ class SmartMoneyAlgoProE5:
                 self.arrmitOBBeara.unshift(False)
         zoneArray.remove(index)
         zoneArrayisMit.remove(index)
+        self._forget_zone(zone)
 
     def ob_found(
         self,
@@ -6081,6 +6115,288 @@ class SmartMoneyAlgoProE5:
         box_obj.set_extend("extend.none")
         return box_obj
 
+    def _get_zone_meta(self, zone: Box) -> Optional[Dict[str, Any]]:
+        return self.ob_metadata.get(id(zone))
+
+    def _zone_base_text(self, zone: Box) -> str:
+        meta = self._get_zone_meta(zone)
+        if meta is not None:
+            text = meta.get("base_text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+        return zone.text.strip()
+
+    def _zone_text_matches(self, zone: Box, target: str) -> bool:
+        if not isinstance(target, str):
+            return False
+        base_text = self._zone_base_text(zone)
+        if base_text == target:
+            return True
+        return zone.text.strip() == target
+
+    def _annotate_order_block(
+        self,
+        zone: Box,
+        *,
+        is_bullish: bool,
+        created_time: Optional[int] = None,
+        source: str = "",
+    ) -> None:
+        created_ts = created_time if isinstance(created_time, int) else self.series.get_time()
+        base_text = zone.text.strip()
+        if not base_text:
+            base_text = "Demand OB" if is_bullish else "Supply OB"
+        meta: Dict[str, Any] = {
+            "is_bullish": is_bullish,
+            "created": created_ts,
+            "touch_count": 0,
+            "last_touch_time": None,
+            "base_text": base_text,
+            "base_fill_color": zone.bgcolor,
+            "base_border_color": zone.border_color,
+            "source": source,
+            "price_inside": False,
+            "text_color_override": None,
+            "mitigated": False,
+        }
+        self.ob_metadata[id(zone)] = meta
+        self._recalculate_zone_strength(zone, meta)
+
+    def _recalculate_zone_strength(
+        self,
+        zone: Box,
+        meta: Optional[Dict[str, Any]] = None,
+        *,
+        historical: bool = False,
+    ) -> None:
+        meta = meta or self._get_zone_meta(zone)
+        if meta is None:
+            return
+        meta.update(self._compute_ob_strength(zone, meta))
+        self._apply_strength_styling(zone, meta, historical=historical)
+
+    def _compute_ob_strength(self, zone: Box, meta: Dict[str, Any]) -> Dict[str, Any]:
+        score = 0.0
+        is_bullish = bool(meta.get("is_bullish"))
+
+        if is_bullish:
+            if self.isBosUp:
+                score += 1.5
+            elif self.isBosDn:
+                score -= 1.5
+            elif self.isCocUp:
+                score += 1.0
+            elif self.isCocDn:
+                score -= 1.0
+        else:
+            if self.isBosDn:
+                score += 1.5
+            elif self.isBosUp:
+                score -= 1.5
+            elif self.isCocDn:
+                score += 1.0
+            elif self.isCocUp:
+                score -= 1.0
+
+        if self._has_nearby_fvg(zone, is_bullish):
+            score += 1.0
+
+        if self._has_liquidity_threat(zone, is_bullish):
+            score -= 1.0
+
+        score += self._session_score(meta.get("created"))
+
+        touch_count = int(meta.get("touch_count", 0))
+        if touch_count == 0:
+            score += 0.5
+        else:
+            score -= min(touch_count, 3) * 0.75
+
+        strength = "neutral"
+        if score >= 1.5:
+            strength = "strong"
+        elif score <= -0.5:
+            strength = "weak"
+
+        return {
+            "score": score,
+            "strength": strength,
+        }
+
+    def _has_nearby_fvg(self, zone: Box, is_bullish: bool) -> bool:
+        holder = self.bullish_gap_holder if is_bullish else self.bearish_gap_holder
+        for i in range(holder.size()):
+            gap_box = holder.get(i)
+            if not isinstance(gap_box, Box):
+                continue
+            if gap_box.bottom <= zone.top and gap_box.top >= zone.bottom:
+                return True
+        return False
+
+    def _has_liquidity_threat(self, zone: Box, is_bullish: bool) -> bool:
+        lookback = 30
+        height = abs(zone.top - zone.bottom)
+        buffer = height * 0.5 if height > 0 else 0.0
+        if is_bullish:
+            lowest = self._series_lowest(self.series, "low", lookback)
+            if not math.isnan(lowest) and lowest < zone.bottom - buffer:
+                return True
+        else:
+            highest = self._series_highest(self.series, "high", lookback)
+            if not math.isnan(highest) and highest > zone.top + buffer:
+                return True
+        return False
+
+    def _session_score(self, timestamp: Optional[int]) -> float:
+        if not isinstance(timestamp, (int, float)) or timestamp <= 0:
+            return 0.0
+        dt = datetime.datetime.utcfromtimestamp(int(timestamp) / 1000.0)
+        decimal_hour = dt.hour + dt.minute / 60.0
+        for start, end in self._ob_killzone_windows:
+            if start <= decimal_hour < end:
+                return 0.5
+        for start, end in self._ob_quiet_windows:
+            if start <= decimal_hour < end:
+                return -0.5
+        return 0.0
+
+    def _apply_strength_styling(
+        self,
+        zone: Box,
+        meta: Dict[str, Any],
+        *,
+        historical: bool = False,
+    ) -> None:
+        ob_inputs = self.inputs.order_block
+        strength = meta.get("strength", "neutral")
+        is_bullish = bool(meta.get("is_bullish"))
+        base_text = meta.get("base_text", zone.text.strip())
+        if not base_text:
+            base_text = "Demand OB" if is_bullish else "Supply OB"
+            meta["base_text"] = base_text
+
+        prefix = "★ " if strength == "strong" else ""
+        strength_display = {
+            "strong": "[Strong]",
+            "neutral": "[Neutral]",
+            "weak": "[Weak]",
+        }.get(strength, "[Neutral]")
+        decorated_text = f"{prefix}{base_text} {strength_display}".strip()
+        zone.set_text(decorated_text)
+
+        meta["is_historical"] = historical or meta.get("is_historical", False)
+        if strength == "strong":
+            chosen_color = ob_inputs.strong_demand_color if is_bullish else ob_inputs.strong_supply_color
+        elif strength == "weak":
+            chosen_color = ob_inputs.weak_demand_color if is_bullish else ob_inputs.weak_supply_color
+        else:
+            chosen_color = ob_inputs.neutral_demand_color if is_bullish else ob_inputs.neutral_supply_color
+
+        if meta.get("mitigated"):
+            fill_color = ob_inputs.colorMitigated
+            border_color = chosen_color
+        else:
+            fill_color = chosen_color
+            border_color = chosen_color
+
+        if historical:
+            border_color = self._color_new_expr(border_color)
+            zone.set_border_width(2)
+        else:
+            zone.set_border_width(1)
+
+        zone.set_bgcolor(fill_color)
+        zone.set_border_color(border_color)
+
+        text_color_override = meta.get("text_color_override")
+        if text_color_override:
+            zone.set_text_color(text_color_override)
+        else:
+            if strength == "weak":
+                zone.set_text_color(self.inputs.order_block.ob_text_color_1)
+            else:
+                zone.set_text_color(
+                    self.inputs.order_block.clrtxtextbull if is_bullish else self.inputs.order_block.clrtxtextbear
+                )
+
+    def _set_zone_label(self, zone: Box, text: str, text_color: Optional[str] = None) -> None:
+        meta = self._get_zone_meta(zone)
+        if meta is None:
+            zone.set_text(text)
+            if text_color is not None:
+                zone.set_text_color(text_color)
+            return
+        meta["base_text"] = text
+        if text_color is not None:
+            meta["text_color_override"] = text_color
+        self._recalculate_zone_strength(zone, meta, historical=meta.get("is_historical", False))
+
+    def _mark_zone_state_change(self, zone: Box, previous: int, new_state: int) -> None:
+        meta = self._get_zone_meta(zone)
+        if meta is None:
+            return
+        touched_states = {2, 3}
+        if previous not in touched_states and new_state in touched_states:
+            meta["touch_count"] = int(meta.get("touch_count", 0)) + 1
+            meta["last_touch_time"] = self.series.get_time()
+            meta["mitigated"] = True
+        self._recalculate_zone_strength(zone, meta, historical=meta.get("is_historical", False))
+
+    def _forget_zone(self, zone: Box) -> None:
+        self.ob_metadata.pop(id(zone), None)
+
+    def _allow_alert_for_strength(self, strength: str) -> bool:
+        ob_inputs = self.inputs.order_block
+        if strength == "strong":
+            return True
+        if strength == "neutral":
+            return ob_inputs.alerts_for_neutral
+        if strength == "weak":
+            return ob_inputs.alerts_for_weak
+        return False
+
+    def _emit_ob_alerts(self, zones: PineArray, *, is_bullish: bool) -> None:
+        if zones.size() == 0:
+            return
+        high = self.series.get("high")
+        low = self.series.get("low")
+        for i in range(zones.size()):
+            zone = zones.get(i)
+            if not isinstance(zone, Box):
+                continue
+            meta = self._get_zone_meta(zone)
+            if meta is None:
+                continue
+            strength = meta.get("strength", "neutral")
+            if not self._allow_alert_for_strength(strength):
+                meta["price_inside"] = False
+                continue
+            inside = False
+            if is_bullish:
+                if not math.isnan(low) and low <= zone.top and low >= zone.bottom:
+                    inside = True
+            else:
+                if not math.isnan(high) and high >= zone.bottom and high <= zone.top:
+                    inside = True
+                elif not math.isnan(high) and high >= zone.bottom:
+                    inside = True
+            prev_inside = bool(meta.get("price_inside"))
+            meta["price_inside"] = inside
+            if inside and not prev_inside:
+                direction = "شراء" if is_bullish else "بيع"
+                zone_type = "منطقة طلب" if is_bullish else "منطقة عرض"
+                price = zone.bottom if is_bullish else zone.top
+                strength_title = {
+                    "strong": "قوية",
+                    "neutral": "محايدة",
+                    "weak": "ضعيفة",
+                }.get(strength, "محايدة")
+                message = (
+                    f"إشارة {direction} من {zone_type} {strength_title} عند سعر {format_price(price)}"
+                )
+                self.alertcondition(True, "Order Block Touch", message)
+
+
     def marginZone(self, zone: Optional[Box]) -> Tuple[float, float, int]:
         if zone is None:
             return NA, NA, 0
@@ -6233,9 +6549,8 @@ class SmartMoneyAlgoProE5:
                 self.lstBxIdm = self.demandZone.get(idx)
                 if self.inputs.order_block.showIdmob:
                     zone = self.demandZone.get(idx)
-                    zone.set_text("IDM OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
+                    self._set_zone_label(zone, "IDM OB", self.inputs.order_block.clrtxtextbulliem)
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6259,9 +6574,8 @@ class SmartMoneyAlgoProE5:
                 self.lstBxIdm = self.supplyZone.get(idx)
                 if self.inputs.order_block.showIdmob:
                     zone = self.supplyZone.get(idx)
-                    zone.set_text("IDM OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
+                    self._set_zone_label(zone, "IDM OB", self.inputs.order_block.clrtxtextbeariem)
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6316,9 +6630,8 @@ class SmartMoneyAlgoProE5:
                 lstBx_ = self.demandZone.get(idx)
                 if self.inputs.order_block.showExob:
                     zone = self.demandZone.get(idx)
-                    zone.set_text("EXT OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
+                    self._set_zone_label(zone, "EXT OB", self.inputs.order_block.clrtxtextbull)
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
@@ -6342,9 +6655,8 @@ class SmartMoneyAlgoProE5:
                 lstBx_ = self.supplyZone.get(idx)
                 if self.inputs.order_block.showExob:
                     zone = self.supplyZone.get(idx)
-                    zone.set_text("EXT OB")
-                    zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
+                    self._set_zone_label(zone, "EXT OB", self.inputs.order_block.clrtxtextbear)
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
@@ -6629,6 +6941,12 @@ class SmartMoneyAlgoProE5:
         )
         zoneArray.push(box_obj)
         zoneArrayisMit.push(0)
+        self._annotate_order_block(
+            box_obj,
+            is_bullish=isBull,
+            created_time=self.series.get_time(),
+            source="handleZone",
+        )
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6652,6 +6970,13 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.demandZoneIsMit.push(0)
+                new_zone = self.demandZone.get(self.demandZone.size() - 1)
+                self._annotate_order_block(
+                    new_zone,
+                    is_bullish=True,
+                    created_time=self.series.get_time(),
+                    source="processZones",
+                )
             elif (not isSupply) and self.series.get("high") > topZone and self.series.get("close") < botZone:
                 self.supplyZone.push(
                     self.createBox(
@@ -6663,6 +6988,13 @@ class SmartMoneyAlgoProE5:
                     )
                 )
                 self.supplyZoneIsMit.push(0)
+                new_zone = self.supplyZone.get(self.supplyZone.size() - 1)
+                self._annotate_order_block(
+                    new_zone,
+                    is_bullish=False,
+                    created_time=self.series.get_time(),
+                    source="processZones",
+                )
             elif (
                 (isSupply and self.series.get("high") >= botZone and self.series.get("high", 1) < botZone)
                 or ((not isSupply) and self.series.get("low") <= topZone and self.series.get("low", 1) > topZone)
@@ -6691,6 +7023,7 @@ class SmartMoneyAlgoProE5:
                         zone.set_bgcolor(self.inputs.order_block.colorMitigated)
                         zone.set_border_color(self.inputs.order_block.colorMitigated)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
+                self._mark_zone_state_change(zone, prev_state, zonesmit.get(i))
                 status = "retest" if prev_state == 1 else "touched"
                 self._register_box_event(zone, status=status, event_time=self.series.get_time())
                 if self.inputs.order_block.showBrkob:
@@ -7152,6 +7485,8 @@ class SmartMoneyAlgoProE5:
         isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
         self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
         self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
+        self._emit_ob_alerts(self.demandZone, is_bullish=True)
+        self._emit_ob_alerts(self.supplyZone, is_bullish=False)
 
         # POI sweeps ---------------------------------------------------------
         if self.inputs.order_block.showPOI and self.series.length() > 4:
