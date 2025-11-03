@@ -1368,6 +1368,7 @@ class SmartMoneyAlgoProE5:
         self.last_liq_low_time: Optional[int] = None
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
+        self.isb_history: List[bool] = []
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -2411,6 +2412,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
         self.motherBar_history: List[int] = [self.motherBar]
+        self.isb_history: List[bool] = []
 
         self.initialised = True
         self.time_history = [time_val]
@@ -6549,24 +6551,29 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     def handleZone(self, zoneArray: PineArray, zoneArrayisMit: PineArray, left: int, top: float, bot: float, color: str, isBull: bool) -> None:
         zone = self.getNLastValue(zoneArray, 1)
+        should_create = True
         if isinstance(zone, Box):
             topZone, botZone, leftZone = zone.top, zone.bottom, zone.left
-            rangeTop = abs(top - topZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
-            rangeBot = abs(bot - botZone) / max(topZone - botZone, 1e-9) < self.mergeRatio
+            denominator = max(topZone - botZone, 1e-9)
+            rangeTop = abs(top - topZone) / denominator < self.mergeRatio
+            rangeBot = abs(bot - botZone) / denominator < self.mergeRatio
             if (top >= topZone and bot <= botZone) or rangeTop or rangeBot:
                 top = max(top, topZone)
                 bot = min(bot, botZone)
                 left = leftZone
                 self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
-        box_obj = self.createBox(
-            left,
-            self.series.get_time(),
-            top,
-            bot,
-            color,
-        )
-        zoneArray.push(box_obj)
-        zoneArrayisMit.push(0)
+            if top <= topZone and bot >= botZone:
+                should_create = False
+        if should_create:
+            box_obj = self.createBox(
+                left,
+                self.series.get_time(),
+                top,
+                bot,
+                color,
+            )
+            zoneArray.push(box_obj)
+            zoneArrayisMit.push(0)
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
@@ -6742,6 +6749,7 @@ class SmartMoneyAlgoProE5:
         self.motherHigh_history.append(self.motherHigh)
         self.motherLow_history.append(self.motherLow)
         self.motherBar_history.append(self.motherBar)
+        self.isb_history.append(bool(isb))
 
         # Top/bottom history -------------------------------------------------
         top = self.getNLastValue(self.arrTop, 1)
@@ -7119,7 +7127,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBS = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
@@ -7157,7 +7169,11 @@ class SmartMoneyAlgoProE5:
                         )
                     self.isSweepOBD = False
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                    if (
+                        self.inputs.order_block.poi_type == "Mother Bar"
+                        and self.series.length() > 2
+                        and self._history_get(self.isb_history, 2, False)
+                    ):
                         mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
                         mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
                         mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
