@@ -1691,6 +1691,7 @@ class SmartMoneyAlgoProE5:
         if math.isnan(high) or math.isnan(low):
             return
         current_time = int(time_val)
+        is_recent_bar = self._within_recent_bars(current_time)
         for key, tracker in list(self._golden_zone_tracking.items()):
             box = tracker.box
             if not isinstance(box, Box):
@@ -1702,6 +1703,8 @@ class SmartMoneyAlgoProE5:
             tracker.touch_times = [
                 ts for ts in tracker.touch_times if self._within_recent_bars(ts)
             ]
+            if not is_recent_bar:
+                continue
             upper = max(box.top, box.bottom)
             lower = min(box.top, box.bottom)
             if any(math.isnan(v) for v in (upper, lower)):
