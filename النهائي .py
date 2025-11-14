@@ -729,6 +729,7 @@ class GoldenZoneTracker:
     box: "Box"
     created_time: int
     touch_times: List[int] = field(default_factory=list)
+    first_touch_time: Optional[int] = None
 
 
 # ----------------------------------------------------------------------------
@@ -1671,9 +1672,9 @@ class SmartMoneyAlgoProE5:
         if isinstance(box, Box):
             self._golden_zone_tracking.pop(id(box), None)
 
-    def _record_golden_zone_creation(self, box: Box, created_time: Optional[int]) -> None:
+    def _record_golden_zone_creation(self, box: Box) -> None:
         try:
-            ts = int(created_time) if created_time is not None else int(self.series.get_time(0))
+            ts = int(self.series.get_time(0))
         except Exception:
             ts = self.series.get_time(0)
         tracker = GoldenZoneTracker(box=box, created_time=ts)
@@ -1700,9 +1701,13 @@ class SmartMoneyAlgoProE5:
             if box not in self.boxes or box.text.strip() != "Golden zone":
                 self._golden_zone_tracking.pop(key, None)
                 continue
+            if not self._within_recent_bars(tracker.created_time):
+                continue
             tracker.touch_times = [
                 ts for ts in tracker.touch_times if self._within_recent_bars(ts)
             ]
+            if tracker.first_touch_time is not None:
+                continue
             if not is_recent_bar:
                 continue
             upper = max(box.top, box.bottom)
@@ -1711,9 +1716,9 @@ class SmartMoneyAlgoProE5:
                 continue
             if high < lower or low > upper:
                 continue
-            if tracker.touch_times:
-                continue
             tracker.touch_times.append(current_time)
+            tracker.first_touch_time = current_time
+            self._register_box_event(box, status="touched", event_time=current_time)
             message = f"{{ticker}} {box.text} First Touch, Range: {format_price(lower)} → {format_price(upper)}"
             self.alertcondition(True, self.GOLDEN_ZONE_FIRST_TOUCH_ALERT, message)
 
@@ -1756,7 +1761,7 @@ class SmartMoneyAlgoProE5:
                 status=status,
             )
             if status_key == "new" and key == "GOLDEN_ZONE":
-                self._record_golden_zone_creation(box, ts)
+                self._record_golden_zone_creation(box)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
