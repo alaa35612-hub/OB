@@ -720,6 +720,18 @@ class Box:
 
 
 # ----------------------------------------------------------------------------
+# Golden zone tracking helpers
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class GoldenZoneTracker:
+    box: "Box"
+    created_time: int
+    touch_times: List[int] = field(default_factory=list)
+
+
+# ----------------------------------------------------------------------------
 # Indicator inputs (1:1 with Pine defaults for targeted packages)
 # ----------------------------------------------------------------------------
 
@@ -1311,12 +1323,15 @@ class SmartMoneyAlgoProE5:
     PDH_TEXT = "PDH"
     PDL_TEXT = "PDL"
     MID_TEXT = "0.5"
+    GOLDEN_ZONE_CREATED_ALERT = "Golden Zone Created"
+    GOLDEN_ZONE_FIRST_TOUCH_ALERT = "Golden Zone First Touch"
 
     def __init__(
         self,
         inputs: Optional[IndicatorInputs] = None,
         base_timeframe: Optional[str] = None,
         tracer: Optional[ExecutionTracer] = None,
+        recent_bars: Optional[int] = None,
     ) -> None:
         self.inputs = inputs or IndicatorInputs()
         self.series = SeriesAccessor()
@@ -1345,6 +1360,12 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = 1
         self.console_max_age_bars = max(1, max_age)
+        self.recent_bars = self._sanitize_recent_bars(recent_bars)
+        self._allowed_alert_titles = {
+            self.GOLDEN_ZONE_CREATED_ALERT,
+            self.GOLDEN_ZONE_FIRST_TOUCH_ALERT,
+        }
+        self._golden_zone_tracking: Dict[int, GoldenZoneTracker] = {}
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1370,6 +1391,16 @@ class SmartMoneyAlgoProE5:
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
         self.isb_history: List[bool] = []
+
+    def set_recent_bars(self, value: Optional[int]) -> None:
+        self.recent_bars = self._sanitize_recent_bars(value)
+
+    def _sanitize_recent_bars(self, value: Optional[int]) -> int:
+        try:
+            candidate = int(value) if value is not None else int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        except (TypeError, ValueError):
+            candidate = int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        return max(1, candidate)
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1434,17 +1465,24 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        if not condition:
+            return
+        if not isinstance(title, str):
+            return
+        if title not in self._allowed_alert_titles:
+            return
+        timestamp = self.series.get_time(0)
+        if not self._within_recent_bars(timestamp):
+            return
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
 
     def _eval_condition(
         self,
@@ -1479,6 +1517,14 @@ class SmartMoneyAlgoProE5:
         if idx < 0:
             return self.series.length()
         return (self.series.length() - 1) - idx
+
+    def _within_recent_bars(self, timestamp: Optional[int]) -> bool:
+        if timestamp is None:
+            return False
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return False
+        return bars_ago <= max(0, self.recent_bars - 1)
 
     def _console_event_within_age(self, timestamp: Any) -> bool:
         if self.console_max_age_bars <= 0:
@@ -1621,6 +1667,53 @@ class SmartMoneyAlgoProE5:
             "source": "confirmed",
         }
 
+    def _untrack_golden_zone(self, box: Optional[Box]) -> None:
+        if isinstance(box, Box):
+            self._golden_zone_tracking.pop(id(box), None)
+
+    def _record_golden_zone_creation(self, box: Box, created_time: Optional[int]) -> None:
+        try:
+            ts = int(created_time) if created_time is not None else int(self.series.get_time(0))
+        except Exception:
+            ts = self.series.get_time(0)
+        tracker = GoldenZoneTracker(box=box, created_time=ts)
+        self._golden_zone_tracking[id(box)] = tracker
+        if not self._within_recent_bars(ts):
+            return
+        lower = min(box.top, box.bottom)
+        upper = max(box.top, box.bottom)
+        message = f"{{ticker}} {box.text} Created, Range: {format_price(lower)} → {format_price(upper)}"
+        self.alertcondition(True, self.GOLDEN_ZONE_CREATED_ALERT, message)
+
+    def _evaluate_golden_zone_touches(self, high: float, low: float, time_val: int) -> None:
+        if not self._golden_zone_tracking:
+            return
+        if math.isnan(high) or math.isnan(low):
+            return
+        current_time = int(time_val)
+        for key, tracker in list(self._golden_zone_tracking.items()):
+            box = tracker.box
+            if not isinstance(box, Box):
+                self._golden_zone_tracking.pop(key, None)
+                continue
+            if box not in self.boxes or box.text.strip() != "Golden zone":
+                self._golden_zone_tracking.pop(key, None)
+                continue
+            tracker.touch_times = [
+                ts for ts in tracker.touch_times if self._within_recent_bars(ts)
+            ]
+            upper = max(box.top, box.bottom)
+            lower = min(box.top, box.bottom)
+            if any(math.isnan(v) for v in (upper, lower)):
+                continue
+            if high < lower or low > upper:
+                continue
+            if tracker.touch_times:
+                continue
+            tracker.touch_times.append(current_time)
+            message = f"{{ticker}} {box.text} First Touch, Range: {format_price(lower)} → {format_price(upper)}"
+            self.alertcondition(True, self.GOLDEN_ZONE_FIRST_TOUCH_ALERT, message)
+
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
         key: Optional[str] = None
@@ -1659,17 +1752,8 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
-            if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
+            if status_key == "new" and key == "GOLDEN_ZONE":
+                self._record_golden_zone_creation(box, ts)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -7214,16 +7298,18 @@ class SmartMoneyAlgoProE5:
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
             if oi1 is not None:
                 if self.bxf and self.bxf in self.boxes:
+                    self._untrack_golden_zone(self.bxf)
                     self.boxes.remove(self.bxf)
                 top_val = ot if not math.isnan(ot) else self.series.get("high")
                 bot_val = ob if not math.isnan(ob) else self.series.get("low")
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
+                self._register_box_event(self.bxf, status="new", event_time=time_val)
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
+        self._evaluate_golden_zone_touches(high, low, time_val)
         self._sync_state_mirrors()
 
 
@@ -8825,7 +8911,12 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            base_timeframe=timeframe,
+            tracer=tracer,
+            recent_bars=window,
+        )
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
@@ -8873,7 +8964,11 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            tracer=tracer,
+            recent_bars=window,
+        )
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -9618,7 +9713,11 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=args.timeframe,
+                recent_bars=recent_window,
+            )
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
@@ -10353,7 +10452,11 @@ def _android_cli_entry() -> int:
                     candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                    runtime = SmartMoneyAlgoProE5(
+                        inputs=inputs,
+                        base_timeframe=args.timeframe,
+                        recent_bars=recent_window,
+                    )
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.process([
