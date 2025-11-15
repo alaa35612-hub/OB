@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -720,6 +720,20 @@ class Box:
 
 
 # ----------------------------------------------------------------------------
+# Golden zone tracking helpers
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class GoldenZoneTracker:
+    box: "Box"
+    created_time: int
+    touch_times: List[int] = field(default_factory=list)
+    first_touch_time: Optional[int] = None
+    has_been_touched: bool = False
+
+
+# ----------------------------------------------------------------------------
 # Indicator inputs (1:1 with Pine defaults for targeted packages)
 # ----------------------------------------------------------------------------
 
@@ -1311,12 +1325,17 @@ class SmartMoneyAlgoProE5:
     PDH_TEXT = "PDH"
     PDL_TEXT = "PDL"
     MID_TEXT = "0.5"
+    GOLDEN_ZONE_CREATED_ALERT = "Golden zone جديدة"
+    GOLDEN_ZONE_FIRST_TOUCH_ALERT = "Golden zone لم يلامسها السعر من قبل ابدأ"
 
     def __init__(
         self,
         inputs: Optional[IndicatorInputs] = None,
         base_timeframe: Optional[str] = None,
         tracer: Optional[ExecutionTracer] = None,
+        recent_bars: Optional[int] = None,
+        enable_golden_zone_creation_alert: bool = True,
+        enable_golden_zone_first_touch_alert: bool = True,
     ) -> None:
         self.inputs = inputs or IndicatorInputs()
         self.series = SeriesAccessor()
@@ -1345,6 +1364,15 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = 1
         self.console_max_age_bars = max(1, max_age)
+        self.recent_bars = self._sanitize_recent_bars(recent_bars)
+        self.enable_golden_zone_creation_alert = bool(enable_golden_zone_creation_alert)
+        self.enable_golden_zone_first_touch_alert = bool(enable_golden_zone_first_touch_alert)
+        self._allowed_alert_titles: Set[str] = set()
+        if self.enable_golden_zone_creation_alert:
+            self._allowed_alert_titles.add(self.GOLDEN_ZONE_CREATED_ALERT)
+        if self.enable_golden_zone_first_touch_alert:
+            self._allowed_alert_titles.add(self.GOLDEN_ZONE_FIRST_TOUCH_ALERT)
+        self._golden_zone_tracking: Dict[int, GoldenZoneTracker] = {}
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1370,6 +1398,16 @@ class SmartMoneyAlgoProE5:
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
         self.isb_history: List[bool] = []
+
+    def set_recent_bars(self, value: Optional[int]) -> None:
+        self.recent_bars = self._sanitize_recent_bars(value)
+
+    def _sanitize_recent_bars(self, value: Optional[int]) -> int:
+        try:
+            candidate = int(value) if value is not None else int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        except (TypeError, ValueError):
+            candidate = int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        return max(1, candidate)
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1434,17 +1472,24 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        if not condition:
+            return
+        if not isinstance(title, str):
+            return
+        if title not in self._allowed_alert_titles:
+            return
+        timestamp = self.series.get_time(0)
+        if not self._within_recent_bars(timestamp):
+            return
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
 
     def _eval_condition(
         self,
@@ -1479,6 +1524,14 @@ class SmartMoneyAlgoProE5:
         if idx < 0:
             return self.series.length()
         return (self.series.length() - 1) - idx
+
+    def _within_recent_bars(self, timestamp: Optional[int]) -> bool:
+        if timestamp is None:
+            return False
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return False
+        return bars_ago <= max(0, self.recent_bars - 1)
 
     def _console_event_within_age(self, timestamp: Any) -> bool:
         if self.console_max_age_bars <= 0:
@@ -1621,6 +1674,85 @@ class SmartMoneyAlgoProE5:
             "source": "confirmed",
         }
 
+    def _untrack_golden_zone(self, box: Optional[Box]) -> None:
+        if isinstance(box, Box):
+            self._golden_zone_tracking.pop(id(box), None)
+
+    def _remove_golden_zone_box(self, box: Optional[Box], *, reset_direction: bool = False) -> None:
+        if not isinstance(box, Box):
+            return
+        self._untrack_golden_zone(box)
+        if box in self.boxes:
+            self.boxes.remove(box)
+        if self.bxf is box:
+            self.bxf = None
+        if reset_direction:
+            self.bxty = 0
+
+    def _record_golden_zone_creation(self, box: Box) -> None:
+        try:
+            ts = int(self.series.get_time(0))
+        except Exception:
+            ts = self.series.get_time(0)
+        tracker = GoldenZoneTracker(box=box, created_time=ts)
+        self._golden_zone_tracking[id(box)] = tracker
+        if not self.enable_golden_zone_creation_alert:
+            return
+        if not self._within_recent_bars(ts):
+            return
+        lower = min(box.top, box.bottom)
+        upper = max(box.top, box.bottom)
+        if any(math.isnan(v) for v in (lower, upper)):
+            return
+        message = (
+            f"Golden zone جديدة – {{ticker}} – المدى: {format_price(lower)} → {format_price(upper)}"
+            f" – الزمن: {format_timestamp(ts)}"
+        )
+        self.alertcondition(True, self.GOLDEN_ZONE_CREATED_ALERT, message)
+
+    def _evaluate_golden_zone_touches(self, high: float, low: float, time_val: int) -> None:
+        if not self._golden_zone_tracking:
+            return
+        if math.isnan(high) or math.isnan(low):
+            return
+        current_time = int(time_val)
+        for key, tracker in list(self._golden_zone_tracking.items()):
+            box = tracker.box
+            if not isinstance(box, Box):
+                self._golden_zone_tracking.pop(key, None)
+                continue
+            if box not in self.boxes or box.text.strip() != "Golden zone":
+                self._golden_zone_tracking.pop(key, None)
+                continue
+            upper = max(box.top, box.bottom)
+            lower = min(box.top, box.bottom)
+            if any(math.isnan(v) for v in (upper, lower)):
+                continue
+            if high < lower or low > upper:
+                continue
+            if tracker.touch_times and tracker.touch_times[-1] == current_time:
+                continue
+            tracker.touch_times.append(current_time)
+            if not tracker.has_been_touched:
+                tracker.first_touch_time = current_time
+                tracker.has_been_touched = True
+                self._register_box_event(box, status="touched", event_time=current_time)
+                if (
+                    self.enable_golden_zone_first_touch_alert
+                    and self._within_recent_bars(tracker.created_time)
+                    and self._within_recent_bars(current_time)
+                ):
+                    message = (
+                        f"{{ticker}} | Golden zone لم يلامسها السعر من قبل ابدأ"
+                        f" | المدى: {format_price(lower)} → {format_price(upper)}"
+                        f" | الزمن: {format_timestamp(current_time)}"
+                    )
+                    self.alertcondition(
+                        True,
+                        self.GOLDEN_ZONE_FIRST_TOUCH_ALERT,
+                        message,
+                    )
+
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
         key: Optional[str] = None
@@ -1659,17 +1791,8 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
-            if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
+            if status_key == "new" and key == "GOLDEN_ZONE":
+                self._record_golden_zone_creation(box)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -2408,7 +2531,7 @@ class SmartMoneyAlgoProE5:
         self.transp = "color.new(color.gray,100)"
         self.bxf: Optional[Box] = None
         self.bxty = 0
-        self.prev_oi1: float = NA
+        self.prev_oi1: Optional[int] = None
 
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
@@ -7208,22 +7331,42 @@ class SmartMoneyAlgoProE5:
         self.drawPrevStrc(self.inputs.structure_util.showMid, self.MID_TEXT, "mid_label", "mid_line", 0.0)
 
         if self.inputs.structure_util.isOTE:
-            if self.bxf is not None:
+            if isinstance(self.bxf, Box):
                 self.bxf.set_right(time_val)
+                min_bound = min(self.bxf.get_top(), self.bxf.get_bottom())
+                max_bound = max(self.bxf.get_top(), self.bxf.get_bottom())
+                should_reset = False
+                if self.bxty == 1 and not math.isnan(low) and low < min_bound:
+                    should_reset = True
+                if self.bxty == -1 and not math.isnan(high) and high > max_bound:
+                    should_reset = True
+                if should_reset:
+                    self._remove_golden_zone_box(self.bxf, reset_direction=True)
             ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
             if oi1 is not None:
-                if self.bxf and self.bxf in self.boxes:
-                    self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+                oi1_int = int(oi1)
+                previous_oi1 = self.prev_oi1
+                should_create = self.bxty != 0
+                if self.bxty == 0:
+                    should_create = previous_oi1 is not None and oi1_int != previous_oi1
+                if should_create:
+                    self._remove_golden_zone_box(self.bxf)
+                    top_val = ot if not math.isnan(ot) else self.series.get("high")
+                    bot_val = ob if not math.isnan(ob) else self.series.get("low")
+                    self.bxf = self.box_new(oi1_int, time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                    self.bxf.set_text("Golden zone")
+                    self.bxf.set_text_color(self.inputs.structure_util.oteclr)
+                    self._register_box_event(self.bxf, status="new", event_time=time_val)
+                    self.bxty = 1 if dir_up else -1
+                self.prev_oi1 = oi1_int
+            else:
+                self.prev_oi1 = None
+        else:
+            self._remove_golden_zone_box(self.bxf, reset_direction=True)
+            self.prev_oi1 = None
 
+        self._evaluate_golden_zone_touches(high, low, time_val)
         self._sync_state_mirrors()
 
 
@@ -8774,6 +8917,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    enable_golden_zone_creation_alert: bool = True,
+    enable_golden_zone_first_touch_alert: bool = True,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8825,7 +8970,14 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            base_timeframe=timeframe,
+            tracer=tracer,
+            recent_bars=window,
+            enable_golden_zone_creation_alert=enable_golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=enable_golden_zone_first_touch_alert,
+        )
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
@@ -8873,7 +9025,13 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            tracer=tracer,
+            recent_bars=window,
+            enable_golden_zone_creation_alert=enable_golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=enable_golden_zone_first_touch_alert,
+        )
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -8941,6 +9099,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=0.0,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
     )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.recent_bars,
+        help="عدد الشموع الحديثة المستخدمة لتقييم تنبيهات Golden zone",
+    )
+    parser.add_argument(
+        "--golden-zone-creation-alert",
+        dest="golden_zone_creation_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تفعيل/تعطيل تنبيه إنشاء Golden zone (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--golden-zone-touch-alert",
+        dest="golden_zone_touch_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تفعيل/تعطيل تنبيه أول ملامسة لمنطقة Golden zone (يدعم true/false)",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -8948,6 +9126,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.recent <= 0:
+        parser.error("--recent يجب أن يكون رقمًا موجبًا")
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -8971,6 +9151,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process([])
@@ -8992,6 +9175,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process(candles)
@@ -9009,6 +9195,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process([])
@@ -9040,6 +9229,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                recent_window_bars=args.recent,
+                enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+                enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
             )
             perform_comparison()
             log("Rendering")
@@ -9158,6 +9350,8 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    golden_zone_creation_alert: bool = True
+    golden_zone_touch_alert: bool = True
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -9287,6 +9481,11 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--golden-zone-creation-alert", dest="golden_zone_creation_alert", action="store_true")
+    p.add_argument("--no-golden-zone-creation-alert", dest="golden_zone_creation_alert", action="store_false")
+    p.add_argument("--golden-zone-touch-alert", dest="golden_zone_touch_alert", action="store_true")
+    p.add_argument("--no-golden-zone-touch-alert", dest="golden_zone_touch_alert", action="store_false")
+    p.set_defaults(golden_zone_creation_alert=True, golden_zone_touch_alert=True)
     args, _ = p.parse_known_args()
 
     cfg = _CLISettings(
@@ -9314,6 +9513,8 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        golden_zone_creation_alert=args.golden_zone_creation_alert,
+        golden_zone_touch_alert=args.golden_zone_touch_alert,
     )
     return cfg, args
 
@@ -9618,7 +9819,13 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=args.timeframe,
+                recent_bars=recent_window,
+                enable_golden_zone_creation_alert=cfg.golden_zone_creation_alert,
+                enable_golden_zone_first_touch_alert=cfg.golden_zone_touch_alert,
+            )
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
@@ -9989,6 +10196,8 @@ class Settings:
         self.bos_plus_retest_window = kw.get("bos_plus_retest_window", 2)
         self.show_ote = kw.get("show_ote", True)
         self.enable_alert_ote_touch = kw.get("enable_alert_ote_touch", True)
+        self.golden_zone_creation_alert = kw.get("golden_zone_creation_alert", True)
+        self.golden_zone_touch_alert = kw.get("golden_zone_touch_alert", True)
         self.strict_close_for_break = kw.get("strict_close_for_break", False)
         self.structure_requires_sweep = kw.get("structure_requires_sweep", False)
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
@@ -10086,6 +10295,20 @@ def _parse_args_android():
     p.add_argument("--no-mark-x", action="store_true")
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
+    p.add_argument(
+        "--golden-zone-creation-alert",
+        dest="golden_zone_creation_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تشغيل/تعطيل تنبيه إنشاء Golden zone (يدعم true/false)",
+    )
+    p.add_argument(
+        "--golden-zone-touch-alert",
+        dest="golden_zone_touch_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تشغيل/تعطيل تنبيه أول ملامسة Golden zone (يدعم true/false)",
+    )
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
     default_threshold = (
         EDITOR_AUTORUN_DEFAULTS.height_threshold
@@ -10208,6 +10431,8 @@ def _parse_args_android():
         bos_plus_retest_window=args.bos_plus_window,
         show_ote=not args.no_ote,
         enable_alert_ote_touch=not args.no_ote_alert,
+        golden_zone_creation_alert=args.golden_zone_creation_alert,
+        golden_zone_touch_alert=args.golden_zone_touch_alert,
         strict_close_for_break=args.strict_close_for_break,
         structure_requires_sweep=args.structure_requires_sweep,
         structure_requires_wick=args.structure_requires_wick,
@@ -10353,7 +10578,13 @@ def _android_cli_entry() -> int:
                     candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                    runtime = SmartMoneyAlgoProE5(
+                        inputs=inputs,
+                        base_timeframe=args.timeframe,
+                        recent_bars=recent_window,
+                        enable_golden_zone_creation_alert=cfg.golden_zone_creation_alert,
+                        enable_golden_zone_first_touch_alert=cfg.golden_zone_touch_alert,
+                    )
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.process([
