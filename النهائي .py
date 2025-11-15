@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -130,6 +130,80 @@ EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
     scan_interval=AUTORUN_SCAN_INTERVAL,
 )
+
+TELEGRAM_ENABLED: bool = False
+TELEGRAM_BOT_TOKEN: str = ""
+TELEGRAM_CHAT_ID: str = ""
+_TELEGRAM_REQUESTS_WARNING_EMITTED = False
+
+
+def _coerce_bool_token(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    token = value.strip().lower()
+    if not token:
+        return None
+    if token in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if token in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return None
+
+
+def _apply_telegram_settings(
+    *, enabled: Optional[bool], token: Optional[str], chat_id: Optional[str]
+) -> None:
+    global TELEGRAM_ENABLED, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+    env_enabled = _coerce_bool_token(os.environ.get("TELEGRAM_ENABLED"))
+    env_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    env_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if env_enabled is not None:
+        TELEGRAM_ENABLED = env_enabled
+    if env_token:
+        TELEGRAM_BOT_TOKEN = env_token
+    if env_chat_id:
+        TELEGRAM_CHAT_ID = env_chat_id
+
+    if enabled is not None:
+        TELEGRAM_ENABLED = enabled
+    if token:
+        TELEGRAM_BOT_TOKEN = token
+    if chat_id:
+        TELEGRAM_CHAT_ID = chat_id
+
+
+def send_telegram_message(text: str) -> None:
+    """Send ``text`` via Telegram if global settings allow it."""
+
+    global _TELEGRAM_REQUESTS_WARNING_EMITTED
+
+    if not TELEGRAM_ENABLED:
+        return
+    if not isinstance(text, str) or not text.strip():
+        return
+    token = TELEGRAM_BOT_TOKEN.strip()
+    chat_id = TELEGRAM_CHAT_ID.strip()
+    if not token or not chat_id:
+        return
+    if requests is None:
+        if not _TELEGRAM_REQUESTS_WARNING_EMITTED:
+            print(
+                "تحذير: مكتبة requests غير متوفرة؛ سيتم تجاهل رسائل تيليجرام.",
+                file=sys.stderr,
+            )
+            _TELEGRAM_REQUESTS_WARNING_EMITTED = True
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        requests.post(url, data=payload, timeout=5)
+    except Exception:
+        pass
+
+
+_apply_telegram_settings(enabled=None, token=None, chat_id=None)
 
 
 @dataclass(frozen=True)
@@ -717,6 +791,21 @@ class Box:
 
     def get_right(self) -> int:
         return self.right
+
+
+# ----------------------------------------------------------------------------
+# Golden zone tracking helpers
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class GoldenZoneTracker:
+    identity: Tuple[int, float, float]
+    box: "Box"
+    created_time: int
+    touch_times: List[int] = field(default_factory=list)
+    first_touch_time: Optional[int] = None
+    has_been_touched: bool = False
 
 
 # ----------------------------------------------------------------------------
@@ -1311,17 +1400,23 @@ class SmartMoneyAlgoProE5:
     PDH_TEXT = "PDH"
     PDL_TEXT = "PDL"
     MID_TEXT = "0.5"
+    GOLDEN_ZONE_CREATED_ALERT = "Golden zone جديدة"
+    GOLDEN_ZONE_FIRST_TOUCH_ALERT = "Golden zone لم يلامسها السعر من قبل ابدأ"
 
     def __init__(
         self,
         inputs: Optional[IndicatorInputs] = None,
         base_timeframe: Optional[str] = None,
         tracer: Optional[ExecutionTracer] = None,
+        recent_bars: Optional[int] = None,
+        enable_golden_zone_creation_alert: bool = True,
+        enable_golden_zone_first_touch_alert: bool = True,
     ) -> None:
         self.inputs = inputs or IndicatorInputs()
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
+        self.symbol: Optional[str] = None
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
@@ -1336,6 +1431,7 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.telegram_last_sent: Dict[str, int] = {}
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1345,6 +1441,16 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = 1
         self.console_max_age_bars = max(1, max_age)
+        self.recent_bars = self._sanitize_recent_bars(recent_bars)
+        self.enable_golden_zone_creation_alert = bool(enable_golden_zone_creation_alert)
+        self.enable_golden_zone_first_touch_alert = bool(enable_golden_zone_first_touch_alert)
+        self._allowed_alert_titles: Set[str] = set()
+        if self.enable_golden_zone_creation_alert:
+            self._allowed_alert_titles.add(self.GOLDEN_ZONE_CREATED_ALERT)
+        if self.enable_golden_zone_first_touch_alert:
+            self._allowed_alert_titles.add(self.GOLDEN_ZONE_FIRST_TOUCH_ALERT)
+        self._golden_zone_tracking: Dict[Tuple[int, float, float], GoldenZoneTracker] = {}
+        self._golden_zone_lookup: Dict[int, Tuple[int, float, float]] = {}
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1370,6 +1476,16 @@ class SmartMoneyAlgoProE5:
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
         self.isb_history: List[bool] = []
+
+    def set_recent_bars(self, value: Optional[int]) -> None:
+        self.recent_bars = self._sanitize_recent_bars(value)
+
+    def _sanitize_recent_bars(self, value: Optional[int]) -> int:
+        try:
+            candidate = int(value) if value is not None else int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        except (TypeError, ValueError):
+            candidate = int(EDITOR_AUTORUN_DEFAULTS.recent_bars)
+        return max(1, candidate)
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1400,6 +1516,17 @@ class SmartMoneyAlgoProE5:
         self._register_label_event(lbl)
         return lbl
 
+    def _send_telegram_alert(self, text: str) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        symbol = self.symbol or "{ticker}"
+        timeframe = (self.base_timeframe or "").strip()
+        if timeframe:
+            payload = f"{symbol} ({timeframe}) | {text}"
+        else:
+            payload = f"{symbol} | {text}"
+        send_telegram_message(payload)
+
     def line_new(
         self, x1: int, y1: float, x2: int, y2: float, xloc: str, color: str, style: str
     ) -> Line:
@@ -1416,10 +1543,12 @@ class SmartMoneyAlgoProE5:
         color: str,
         text: str = "",
         text_color: str = "#000000",
+        *,
+        event_time: Optional[int] = None,
     ) -> Box:
         bx = Box(left, right, top, bottom, color, color, text=text, text_color=text_color)
         self.boxes.append(bx)
-        self._register_box_event(bx, status="new")
+        self._register_box_event(bx, status="new", event_time=event_time)
         self._trace("box.new", "create", timestamp=right, left=left, right=right, top=top, bottom=bottom, color=color, text=text)
         return bx
 
@@ -1434,17 +1563,34 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        if not condition:
+            return
+        if not isinstance(title, str):
+            return
+        if title not in self._allowed_alert_titles:
+            return
+        timestamp = self.series.get_time(0)
+        if not self._within_recent_bars(timestamp):
+            return
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
+        close_price = self.series.get("close")
+        price_display = format_price(close_price if isinstance(close_price, (int, float)) else None)
+        time_display = format_timestamp(timestamp)
+        pieces = [title]
+        if message:
+            pieces.append(message)
+        pieces.append(f"السعر: {price_display}")
+        pieces.append(f"الوقت: {time_display}")
+        alert_text = " | ".join(pieces)
+        self._send_telegram_alert(alert_text)
 
     def _eval_condition(
         self,
@@ -1479,6 +1625,14 @@ class SmartMoneyAlgoProE5:
         if idx < 0:
             return self.series.length()
         return (self.series.length() - 1) - idx
+
+    def _within_recent_bars(self, timestamp: Optional[int]) -> bool:
+        if timestamp is None:
+            return False
+        bars_ago = self._bars_ago_from_time(timestamp)
+        if bars_ago is None:
+            return False
+        return bars_ago <= max(0, self.recent_bars - 1)
 
     def _console_event_within_age(self, timestamp: Any) -> bool:
         if self.console_max_age_bars <= 0:
@@ -1559,6 +1713,65 @@ class SmartMoneyAlgoProE5:
         metrics["latest_events"] = self._collect_latest_console_events()
         return metrics
 
+    def _format_telegram_price_key(self, price: Any) -> str:
+        if isinstance(price, (int, float)):
+            try:
+                value = float(price)
+            except (TypeError, ValueError):
+                return "nan"
+            if math.isnan(value):
+                return "nan"
+            return f"{round(value, 6):.6f}"
+        if isinstance(price, (tuple, list)) and price:
+            scalars: List[float] = []
+            for item in price:
+                if isinstance(item, (int, float)):
+                    try:
+                        scalars.append(float(item))
+                    except (TypeError, ValueError):
+                        continue
+            if scalars:
+                lower = min(scalars)
+                upper = max(scalars)
+                return f"{round(lower, 6):.6f}:{round(upper, 6):.6f}"
+        return "nan"
+
+    def _record_telegram_console_event(
+        self,
+        key: str,
+        description: str,
+        *,
+        status: str,
+        price: Any,
+        timestamp: Optional[int],
+    ) -> None:
+        if not TELEGRAM_ENABLED:
+            return
+        if not key or not description:
+            return
+        recency_ok = False
+        if timestamp is None:
+            recency_ok = True
+        else:
+            recency_ok = self._console_event_within_age(timestamp) or self._within_recent_bars(timestamp)
+        if not recency_ok:
+            return
+        price_key = self._format_telegram_price_key(price)
+        dedupe_key = f"{key}:{status}:{price_key}"
+        ts_value: Optional[int]
+        if isinstance(timestamp, (int, float)):
+            ts_value = int(timestamp)
+        else:
+            current_time = self.series.get_time(0)
+            ts_value = int(current_time) if isinstance(current_time, (int, float)) else None
+        last_sent = self.telegram_last_sent.get(dedupe_key)
+        if ts_value is not None and last_sent == ts_value:
+            return
+        self._send_telegram_alert(description)
+        if ts_value is None:
+            ts_value = int(time.time() * 1000)
+        self.telegram_last_sent[dedupe_key] = ts_value
+
     def _register_label_event(self, label: Label) -> None:
         text = label.text.strip()
         collapsed = text.replace(" ", "")
@@ -1591,14 +1804,22 @@ class SmartMoneyAlgoProE5:
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
                     return
-            self.console_event_log[key] = {
+            event_payload = {
                 "text": label.text,
                 "price": label.y,
                 "time": label.x,
                 "time_display": format_timestamp(label.x),
                 "display": f"{label.text} @ {format_price(label.y)}",
             }
+            self.console_event_log[key] = event_payload
             self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
+            self._record_telegram_console_event(
+                key,
+                event_payload["display"],
+                status="label",
+                price=label.y,
+                timestamp=label.x,
+            )
 
     def _register_structure_break_event(
         self,
@@ -1620,6 +1841,191 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "source": "confirmed",
         }
+        self._record_telegram_console_event(
+            key,
+            display,
+            status="bullish" if bullish else "bearish",
+            price=price,
+            timestamp=timestamp,
+        )
+
+    def _untrack_golden_zone(self, box: Optional[Box]) -> None:
+        if not isinstance(box, Box):
+            return
+        identity = self._golden_zone_lookup.pop(id(box), None)
+        if identity is None:
+            return
+        tracker = self._golden_zone_tracking.get(identity)
+        if tracker is not None and tracker.box is box:
+            self._golden_zone_tracking.pop(identity, None)
+
+    def _remove_golden_zone_box(self, box: Optional[Box], *, reset_direction: bool = False) -> None:
+        if not isinstance(box, Box):
+            if reset_direction:
+                self.bxty = 0
+            self._clear_inactive_golden_zone_console_event()
+            return
+        self._untrack_golden_zone(box)
+        if box in self.boxes:
+            self.boxes.remove(box)
+        if self.bxf is box:
+            self.bxf = None
+        if reset_direction:
+            self.bxty = 0
+        self._clear_inactive_golden_zone_console_event()
+
+    def _has_active_golden_zone(self) -> bool:
+        for tracker in self._golden_zone_tracking.values():
+            box = tracker.box
+            if isinstance(box, Box) and box in self.boxes and box.text.strip() == "Golden zone":
+                return True
+        return False
+
+    def _clear_inactive_golden_zone_console_event(self) -> None:
+        if not self._has_active_golden_zone():
+            self.console_event_log.pop("GOLDEN_ZONE", None)
+
+    def _compute_golden_zone_identity(
+        self, left: Any, top: float, bottom: float
+    ) -> Optional[Tuple[int, float, float]]:
+        """Return a stable (left, lower, upper) fingerprint for a Golden zone box."""
+        if not isinstance(left, (int, float)):
+            return None
+        if any(math.isnan(v) for v in (top, bottom)):
+            return None
+        lower = min(top, bottom)
+        upper = max(top, bottom)
+        if any(math.isnan(v) for v in (lower, upper)):
+            return None
+        left_int = int(left)
+        return (left_int, round(lower, 8), round(upper, 8))
+
+    def _golden_zone_identity(self, box: Optional[Box]) -> Optional[Tuple[int, float, float]]:
+        """Resolve the identity tuple for an existing Golden zone box object."""
+        if not isinstance(box, Box):
+            return None
+        return self._compute_golden_zone_identity(box.left, box.top, box.bottom)
+
+    def _backfill_golden_zone_tracker(self, tracker: GoldenZoneTracker) -> None:
+        """Scan historical bars to mark zones that were already mitigated before now."""
+        if tracker.has_been_touched:
+            return
+        if self.series.length() <= 1:
+            return
+        box = tracker.box
+        if not isinstance(box, Box):
+            return
+        lower = min(box.top, box.bottom)
+        upper = max(box.top, box.bottom)
+        if any(math.isnan(v) for v in (lower, upper)):
+            return
+        times = self.series.time
+        if not times:
+            return
+        start_time = int(min(getattr(box, "left", tracker.created_time), tracker.created_time))
+        end_index = len(times) - 2
+        if end_index < 0:
+            return
+        start_index = bisect.bisect_left(times, start_time)
+        if start_index < 0:
+            start_index = 0
+        for idx in range(start_index, end_index + 1):
+            high_val = self.series.high[idx]
+            low_val = self.series.low[idx]
+            if math.isnan(high_val) or math.isnan(low_val):
+                continue
+            if high_val < lower or low_val > upper:
+                continue
+            touch_time = times[idx]
+            tracker.touch_times.append(touch_time)
+            tracker.first_touch_time = touch_time
+            tracker.has_been_touched = True
+            break
+
+    def _emit_golden_zone_creation_alert(self, tracker: GoldenZoneTracker) -> None:
+        """Emit the 'new Golden zone' alert when the zone is inside the recency window."""
+        if not self.enable_golden_zone_creation_alert:
+            return
+        created_time = tracker.created_time
+        if not self._within_recent_bars(created_time):
+            return
+        box = tracker.box
+        if not isinstance(box, Box):
+            return
+        lower = min(box.top, box.bottom)
+        upper = max(box.top, box.bottom)
+        if any(math.isnan(v) for v in (lower, upper)):
+            return
+        message = (
+            f"Golden zone جديدة – {{ticker}} – المدى: {format_price(lower)} → {format_price(upper)}"
+            f" – الزمن: {format_timestamp(created_time)}"
+        )
+        self.alertcondition(True, self.GOLDEN_ZONE_CREATED_ALERT, message)
+
+    def _register_golden_zone_tracker(
+        self,
+        box: Box,
+        identity: Optional[Tuple[int, float, float]],
+        created_time: int,
+    ) -> None:
+        """Attach runtime tracking to a Golden zone box and emit alerts if appropriate."""
+        if identity is None:
+            return
+        tracker = self._golden_zone_tracking.get(identity)
+        if tracker is None:
+            tracker = GoldenZoneTracker(identity=identity, box=box, created_time=created_time)
+            self._golden_zone_tracking[identity] = tracker
+            self._golden_zone_lookup[id(box)] = identity
+            self._backfill_golden_zone_tracker(tracker)
+            self._emit_golden_zone_creation_alert(tracker)
+        else:
+            tracker.box = box
+            tracker.created_time = min(tracker.created_time, created_time)
+            self._golden_zone_lookup[id(box)] = identity
+
+    def _evaluate_golden_zone_touches(self, high: float, low: float, time_val: int) -> None:
+        if not self._golden_zone_tracking:
+            return
+        if math.isnan(high) or math.isnan(low):
+            return
+        current_time = int(time_val)
+        for identity, tracker in list(self._golden_zone_tracking.items()):
+            box = tracker.box
+            if not isinstance(box, Box):
+                self._golden_zone_tracking.pop(identity, None)
+                continue
+            if box not in self.boxes or box.text.strip() != "Golden zone":
+                self._golden_zone_lookup.pop(id(box), None)
+                self._golden_zone_tracking.pop(identity, None)
+                continue
+            upper = max(box.top, box.bottom)
+            lower = min(box.top, box.bottom)
+            if any(math.isnan(v) for v in (upper, lower)):
+                continue
+            if high < lower or low > upper:
+                continue
+            if tracker.touch_times and tracker.touch_times[-1] == current_time:
+                continue
+            tracker.touch_times.append(current_time)
+            if not tracker.has_been_touched:
+                tracker.first_touch_time = current_time
+                tracker.has_been_touched = True
+                self._register_box_event(box, status="touched", event_time=current_time)
+                if (
+                    self.enable_golden_zone_first_touch_alert
+                    and self._within_recent_bars(tracker.created_time)
+                    and self._within_recent_bars(current_time)
+                ):
+                    message = (
+                        f"{{ticker}} | Golden zone لم يلامسها السعر من قبل ابدأ"
+                        f" | المدى: {format_price(lower)} → {format_price(upper)}"
+                        f" | الزمن: {format_timestamp(current_time)}"
+                    )
+                    self.alertcondition(
+                        True,
+                        self.GOLDEN_ZONE_FIRST_TOUCH_ALERT,
+                        message,
+                    )
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1640,7 +2046,7 @@ class SmartMoneyAlgoProE5:
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
-            self.console_event_log[key] = {
+            event_payload = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
                 "time": ts,
@@ -1649,6 +2055,7 @@ class SmartMoneyAlgoProE5:
                 "status": status,
                 "status_display": status_label,
             }
+            self.console_event_log[key] = event_payload
             self._trace(
                 "box",
                 "register",
@@ -1659,17 +2066,33 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
-            if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
+            description = event_payload["display"]
+            if key == "GOLDEN_ZONE":
+                lower = format_price(min(box.top, box.bottom))
+                upper = format_price(max(box.top, box.bottom))
+                if status_key == "new":
+                    description = f"Golden zone جديدة – المدى: {lower} → {upper}"
+                elif status_key == "touched":
+                    description = f"Golden zone لم يلامسها السعر من قبل ابدأ – المدى: {lower} → {upper}"
+                elif status_key == "retest":
+                    description = f"Golden zone إعادة اختبار – المدى: {lower} → {upper}"
+            else:
+                description = f"{box.text} {status_label}"
+            self._record_telegram_console_event(
+                key,
+                description,
+                status=status_key,
+                price=(box.bottom, box.top),
+                timestamp=ts,
+            )
+            if key == "GOLDEN_ZONE" and status_key == "new":
+                # Golden zone trackers are managed explicitly within the OTE
+                # construction logic to avoid treating redraws as new zones.
+                identity = self._golden_zone_identity(box)
+                if identity is not None:
+                    self._golden_zone_lookup[id(box)] = identity
+                else:
+                    self._golden_zone_lookup.pop(id(box), None)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -1678,6 +2101,8 @@ class SmartMoneyAlgoProE5:
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
             if not self._console_event_within_age(payload.get("time")):
+                continue
+            if key == "GOLDEN_ZONE" and not self._has_active_golden_zone():
                 continue
             events[key] = payload
 
@@ -2408,7 +2833,7 @@ class SmartMoneyAlgoProE5:
         self.transp = "color.new(color.gray,100)"
         self.bxf: Optional[Box] = None
         self.bxty = 0
-        self.prev_oi1: float = NA
+        self.prev_oi1: Optional[int] = None
 
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
@@ -7207,23 +7632,85 @@ class SmartMoneyAlgoProE5:
         self.drawPrevStrc(self.inputs.structure_util.showPdl, self.PDL_TEXT, "pdl_label", "pdl_line", 0.0)
         self.drawPrevStrc(self.inputs.structure_util.showMid, self.MID_TEXT, "mid_label", "mid_line", 0.0)
 
-        if self.inputs.structure_util.isOTE:
-            if self.bxf is not None:
-                self.bxf.set_right(time_val)
-            ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
-            ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
-            if oi1 is not None:
-                if self.bxf and self.bxf in self.boxes:
-                    self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
-
+        structure_util_inputs = self.inputs.structure_util
+        # Golden zone / OTE handling mirrors the Pine `if isOTE` branch, including
+        # the `oi1 != oi1[1]` check that only spawns a new box when the structure
+        # index actually changes while no zone is active.
+        if structure_util_inputs.isOTE:
+            current_box = self.bxf if isinstance(self.bxf, Box) else None
+            if isinstance(current_box, Box):
+                current_box.set_right(time_val)
+                min_bound = min(current_box.get_top(), current_box.get_bottom())
+                max_bound = max(current_box.get_top(), current_box.get_bottom())
+                should_reset = False
+                if self.bxty == 1 and not math.isnan(low) and low < min_bound:
+                    should_reset = True
+                if self.bxty == -1 and not math.isnan(high) and high > max_bound:
+                    should_reset = True
+                if should_reset:
+                    self._remove_golden_zone_box(current_box, reset_direction=True)
+                    current_box = None
+            ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", structure_util_inputs.ote1)
+            ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", structure_util_inputs.ote2)
+            previous_oi1 = self.prev_oi1
+            oi1_value: Optional[int] = None
+            if oi1 is not None and not math.isnan(oi1):
+                oi1_value = int(oi1)
+                top_val = ot if isinstance(ot, (int, float)) and not math.isnan(ot) else self.series.get("high")
+                bot_val = ob if isinstance(ob, (int, float)) and not math.isnan(ob) else self.series.get("low")
+                top_val = top_val if isinstance(top_val, (int, float)) else math.nan
+                bot_val = bot_val if isinstance(bot_val, (int, float)) else math.nan
+                if not math.isnan(top_val) and not math.isnan(bot_val):
+                    should_manage = self.bxty != 0 or previous_oi1 is None or oi1_value != previous_oi1
+                    if should_manage:
+                        identity = self._compute_golden_zone_identity(oi1_value, top_val, bot_val)
+                        current_identity = (
+                            self._golden_zone_lookup.get(id(current_box)) if isinstance(current_box, Box) else None
+                        )
+                        needs_new_box = (
+                            not isinstance(current_box, Box)
+                            or current_identity is None
+                            or identity is None
+                            or identity != current_identity
+                        )
+                        if needs_new_box:
+                            if isinstance(current_box, Box):
+                                self._remove_golden_zone_box(current_box)
+                            current_box = None
+                            if identity is not None:
+                                new_box = self.box_new(
+                                    oi1_value,
+                                    time_val,
+                                    top_val,
+                                    bot_val,
+                                    structure_util_inputs.oteclr,
+                                    text="Golden zone",
+                                    text_color=structure_util_inputs.oteclr,
+                                    event_time=int(time_val),
+                                )
+                                self.bxf = new_box
+                                current_box = new_box
+                                self._register_golden_zone_tracker(new_box, identity, int(time_val))
+                            else:
+                                self.bxf = None
+                                self.bxty = 0
+                        if isinstance(current_box, Box) and identity is not None:
+                            current_box.set_lefttop(oi1_value, top_val)
+                            current_box.set_rightbottom(time_val, bot_val)
+                            current_box.set_bgcolor(structure_util_inputs.oteclr)
+                            current_box.set_border_color(structure_util_inputs.oteclr)
+                            current_box.set_text("Golden zone")
+                            current_box.set_text_color(structure_util_inputs.oteclr)
+                            self._register_golden_zone_tracker(current_box, identity, int(time_val))
+                            self.bxty = 1 if dir_up else -1
+            self.prev_oi1 = oi1_value
+            self._evaluate_golden_zone_touches(high, low, time_val)
+        else:
+            self._remove_golden_zone_box(self.bxf, reset_direction=True)
+            self.prev_oi1 = None
+            self._golden_zone_tracking.clear()
+            self._golden_zone_lookup.clear()
+            self._clear_inactive_golden_zone_console_event()
         self._sync_state_mirrors()
 
 
@@ -8625,6 +9112,62 @@ EVENT_DISPLAY_ORDER = [
 ]
 
 
+def _count_recent_alerts(runtime: "SmartMoneyAlgoProE5", window: int) -> int:
+    alerts = list(getattr(runtime, "alerts", []))
+    if not alerts:
+        return 0
+    if window <= 0:
+        return len(alerts)
+    series = getattr(runtime, "series", None)
+    if series is None or series.length() == 0:
+        return len(alerts)
+    cutoff_idx = max(0, series.length() - window)
+    cutoff_time = series.get_time(cutoff_idx)
+    if cutoff_time is None:
+        return len(alerts)
+    return sum(1 for ts, _ in alerts if isinstance(ts, (int, float)) and ts >= cutoff_time)
+
+
+def _build_event_highlights(latest_events: Dict[str, Any], limit: int = 3) -> List[str]:
+    highlights: List[str] = []
+    if not isinstance(latest_events, dict):
+        return highlights
+    for key, _ in EVENT_DISPLAY_ORDER:
+        event = latest_events.get(key)
+        if not isinstance(event, dict):
+            continue
+        display = event.get("display") or event.get("text")
+        if not display:
+            continue
+        status_display = event.get("status_display")
+        if status_display:
+            display = f"{display} [{status_display}]"
+        highlights.append(display)
+        if len(highlights) >= limit:
+            break
+    return highlights
+
+
+def _send_symbol_summary_to_telegram(
+    symbol: str,
+    timeframe: str,
+    runtime: "SmartMoneyAlgoProE5",
+    metrics: Dict[str, Any],
+    window: int,
+) -> None:
+    if not TELEGRAM_ENABLED:
+        return
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else None
+    highlights = _build_event_highlights(latest_events or {})
+    highlight_text = " | ".join(highlights) if highlights else "لا أحداث جديدة"
+    recent_alert_count = _count_recent_alerts(runtime, window)
+    message = (
+        f"{symbol} ({timeframe}) | تنبيهات خلال آخر {window} شموع: {recent_alert_count}"
+        f" | أهم الأحداث: {highlight_text}"
+    )
+    send_telegram_message(message)
+
+
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
     header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
     symbol_display = _format_symbol(symbol)
@@ -8774,6 +9317,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    enable_golden_zone_creation_alert: bool = True,
+    enable_golden_zone_first_touch_alert: bool = True,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8825,7 +9370,15 @@ def scan_binance(
                 )
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+        runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            base_timeframe=timeframe,
+            tracer=tracer,
+            recent_bars=window,
+            enable_golden_zone_creation_alert=enable_golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=enable_golden_zone_first_touch_alert,
+        )
+        runtime.symbol = symbol
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
@@ -8861,6 +9414,7 @@ def scan_binance(
             }
         )
         print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+        _send_symbol_summary_to_telegram(symbol, timeframe, runtime, metrics, window)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -8873,7 +9427,13 @@ def scan_binance(
         if primary_runtime is None:
             primary_runtime = runtime
     if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+        primary_runtime = SmartMoneyAlgoProE5(
+            inputs=inputs,
+            tracer=tracer,
+            recent_bars=window,
+            enable_golden_zone_creation_alert=enable_golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=enable_golden_zone_first_touch_alert,
+        )
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -8941,6 +9501,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=0.0,
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
     )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=EDITOR_AUTORUN_DEFAULTS.recent_bars,
+        help="عدد الشموع الحديثة المستخدمة لتقييم تنبيهات Golden zone",
+    )
+    parser.add_argument(
+        "--golden-zone-creation-alert",
+        dest="golden_zone_creation_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تفعيل/تعطيل تنبيه إنشاء Golden zone (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--golden-zone-touch-alert",
+        dest="golden_zone_touch_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تفعيل/تعطيل تنبيه أول ملامسة لمنطقة Golden zone (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--telegram-enabled",
+        dest="telegram_enabled",
+        action=_OptionalBoolAction,
+        default=None,
+        help="تفعيل/تعطيل إرسال التنبيهات والأحداث إلى تيليجرام",
+    )
+    parser.add_argument(
+        "--telegram-token",
+        dest="telegram_token",
+        type=str,
+        default=None,
+        help="توكن بوت تيليجرام المستخدم للإرسال",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        dest="telegram_chat_id",
+        type=str,
+        default=None,
+        help="Chat ID أو معرف القناة المستهدف في تيليجرام",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -8948,6 +9549,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.recent <= 0:
+        parser.error("--recent يجب أن يكون رقمًا موجبًا")
+    _apply_telegram_settings(
+        enabled=args.telegram_enabled,
+        token=args.telegram_token,
+        chat_id=args.telegram_chat_id,
+    )
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -8971,6 +9579,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process([])
@@ -8992,6 +9603,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process(candles)
@@ -9009,6 +9623,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
+            recent_bars=args.recent,
+            enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+            enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
         )
         log("Timeline")
         runtime.process([])
@@ -9040,6 +9657,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                recent_window_bars=args.recent,
+                enable_golden_zone_creation_alert=args.golden_zone_creation_alert,
+                enable_golden_zone_first_touch_alert=args.golden_zone_touch_alert,
             )
             perform_comparison()
             log("Rendering")
@@ -9158,6 +9778,8 @@ class _CLISettings:
     # scanner controls
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    golden_zone_creation_alert: bool = True
+    golden_zone_touch_alert: bool = True
     # matching indicator behavior
     ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
     zone_type: str = "Mother Bar"  # goes to order_block.poi_type
@@ -9287,6 +9909,11 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
+    p.add_argument("--golden-zone-creation-alert", dest="golden_zone_creation_alert", action="store_true")
+    p.add_argument("--no-golden-zone-creation-alert", dest="golden_zone_creation_alert", action="store_false")
+    p.add_argument("--golden-zone-touch-alert", dest="golden_zone_touch_alert", action="store_true")
+    p.add_argument("--no-golden-zone-touch-alert", dest="golden_zone_touch_alert", action="store_false")
+    p.set_defaults(golden_zone_creation_alert=True, golden_zone_touch_alert=True)
     args, _ = p.parse_known_args()
 
     cfg = _CLISettings(
@@ -9314,6 +9941,8 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
         exclude_patterns=args.exclude_patterns,
         include_only=args.include_only,
         drop_last_incomplete=args.drop_last,
+        golden_zone_creation_alert=args.golden_zone_creation_alert,
+        golden_zone_touch_alert=args.golden_zone_touch_alert,
     )
     return cfg, args
 
@@ -9618,7 +10247,14 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+            runtime = SmartMoneyAlgoProE5(
+                inputs=inputs,
+                base_timeframe=args.timeframe,
+                recent_bars=recent_window,
+                enable_golden_zone_creation_alert=cfg.golden_zone_creation_alert,
+                enable_golden_zone_first_touch_alert=cfg.golden_zone_touch_alert,
+            )
+            runtime.symbol = sym
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
@@ -9679,6 +10315,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
                 colored_title = _colorize_directional_text(title)
                 print(f"  - {ts_s} :: {colored_title}")
             alerts_total += len(recent_alerts)
+            _send_symbol_summary_to_telegram(sym, args.timeframe, runtime, metrics, recent_window)
 
     if args.verbose:
         print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
@@ -9989,6 +10626,8 @@ class Settings:
         self.bos_plus_retest_window = kw.get("bos_plus_retest_window", 2)
         self.show_ote = kw.get("show_ote", True)
         self.enable_alert_ote_touch = kw.get("enable_alert_ote_touch", True)
+        self.golden_zone_creation_alert = kw.get("golden_zone_creation_alert", True)
+        self.golden_zone_touch_alert = kw.get("golden_zone_touch_alert", True)
         self.strict_close_for_break = kw.get("strict_close_for_break", False)
         self.structure_requires_sweep = kw.get("structure_requires_sweep", False)
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
@@ -10086,6 +10725,20 @@ def _parse_args_android():
     p.add_argument("--no-mark-x", action="store_true")
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
+    p.add_argument(
+        "--golden-zone-creation-alert",
+        dest="golden_zone_creation_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تشغيل/تعطيل تنبيه إنشاء Golden zone (يدعم true/false)",
+    )
+    p.add_argument(
+        "--golden-zone-touch-alert",
+        dest="golden_zone_touch_alert",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تشغيل/تعطيل تنبيه أول ملامسة Golden zone (يدعم true/false)",
+    )
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
     default_threshold = (
         EDITOR_AUTORUN_DEFAULTS.height_threshold
@@ -10208,6 +10861,8 @@ def _parse_args_android():
         bos_plus_retest_window=args.bos_plus_window,
         show_ote=not args.no_ote,
         enable_alert_ote_touch=not args.no_ote_alert,
+        golden_zone_creation_alert=args.golden_zone_creation_alert,
+        golden_zone_touch_alert=args.golden_zone_touch_alert,
         strict_close_for_break=args.strict_close_for_break,
         structure_requires_sweep=args.structure_requires_sweep,
         structure_requires_wick=args.structure_requires_wick,
@@ -10353,7 +11008,14 @@ def _android_cli_entry() -> int:
                     candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
                     if cfg.drop_last_incomplete and candles:
                         candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                    runtime = SmartMoneyAlgoProE5(
+                        inputs=inputs,
+                        base_timeframe=args.timeframe,
+                        recent_bars=recent_window,
+                        enable_golden_zone_creation_alert=cfg.golden_zone_creation_alert,
+                        enable_golden_zone_first_touch_alert=cfg.golden_zone_touch_alert,
+                    )
+                    runtime.symbol = sym
                     runtime._bos_break_source = cfg.bos_confirmation
                     runtime._strict_close_for_break = cfg.strict_close_for_break
                     runtime.process([
@@ -10399,6 +11061,7 @@ def _android_cli_entry() -> int:
                 if recent_alerts or args.verbose:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
+                    _send_symbol_summary_to_telegram(sym, args.timeframe, runtime, metrics, recent_window)
 
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
