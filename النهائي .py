@@ -1690,6 +1690,9 @@ class SmartMoneyAlgoProE5:
 
     def _remove_golden_zone_box(self, box: Optional[Box], *, reset_direction: bool = False) -> None:
         if not isinstance(box, Box):
+            if reset_direction:
+                self.bxty = 0
+            self._clear_inactive_golden_zone_console_event()
             return
         self._untrack_golden_zone(box)
         if box in self.boxes:
@@ -1698,6 +1701,18 @@ class SmartMoneyAlgoProE5:
             self.bxf = None
         if reset_direction:
             self.bxty = 0
+        self._clear_inactive_golden_zone_console_event()
+
+    def _has_active_golden_zone(self) -> bool:
+        for tracker in self._golden_zone_tracking.values():
+            box = tracker.box
+            if isinstance(box, Box) and box in self.boxes and box.text.strip() == "Golden zone":
+                return True
+        return False
+
+    def _clear_inactive_golden_zone_console_event(self) -> None:
+        if not self._has_active_golden_zone():
+            self.console_event_log.pop("GOLDEN_ZONE", None)
 
     def _compute_golden_zone_identity(
         self, left: Any, top: float, bottom: float
@@ -1895,6 +1910,8 @@ class SmartMoneyAlgoProE5:
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
             if not self._console_event_within_age(payload.get("time")):
+                continue
+            if key == "GOLDEN_ZONE" and not self._has_active_golden_zone():
                 continue
             events[key] = payload
 
@@ -7424,77 +7441,85 @@ class SmartMoneyAlgoProE5:
         self.drawPrevStrc(self.inputs.structure_util.showPdl, self.PDL_TEXT, "pdl_label", "pdl_line", 0.0)
         self.drawPrevStrc(self.inputs.structure_util.showMid, self.MID_TEXT, "mid_label", "mid_line", 0.0)
 
-        if self.inputs.structure_util.isOTE:
-            if isinstance(self.bxf, Box):
-                self.bxf.set_right(time_val)
-                min_bound = min(self.bxf.get_top(), self.bxf.get_bottom())
-                max_bound = max(self.bxf.get_top(), self.bxf.get_bottom())
+        structure_util_inputs = self.inputs.structure_util
+        # Golden zone / OTE handling mirrors the Pine `if isOTE` branch, including
+        # the `oi1 != oi1[1]` check that only spawns a new box when the structure
+        # index actually changes while no zone is active.
+        if structure_util_inputs.isOTE:
+            current_box = self.bxf if isinstance(self.bxf, Box) else None
+            if isinstance(current_box, Box):
+                current_box.set_right(time_val)
+                min_bound = min(current_box.get_top(), current_box.get_bottom())
+                max_bound = max(current_box.get_top(), current_box.get_bottom())
                 should_reset = False
                 if self.bxty == 1 and not math.isnan(low) and low < min_bound:
                     should_reset = True
                 if self.bxty == -1 and not math.isnan(high) and high > max_bound:
                     should_reset = True
                 if should_reset:
-                    self._remove_golden_zone_box(self.bxf, reset_direction=True)
-            ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
-            ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
-            if oi1 is not None:
-                oi1_int = int(oi1)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                identity = self._compute_golden_zone_identity(oi1_int, top_val, bot_val)
-                current_box = self.bxf if isinstance(self.bxf, Box) else None
-                current_identity = self._golden_zone_lookup.get(id(current_box)) if isinstance(current_box, Box) else None
-                previous_oi1 = self.prev_oi1
-                # Pine redraws the OTE box every bar, so we derive a stable identity
-                # tuple and reuse the existing ``Box`` whenever the fingerprint
-                # matches the current structure.
-                needs_new_box = (
-                    not isinstance(current_box, Box)
-                    or current_identity is None
-                    or current_identity != identity
-                )
-                if self.bxty == 0:
-                    needs_new_box = needs_new_box or previous_oi1 is None or oi1_int != previous_oi1
-                if needs_new_box:
-                    if isinstance(current_box, Box):
-                        self._remove_golden_zone_box(current_box)
-                    if identity is not None:
-                        new_box = self.box_new(
-                            oi1_int,
-                            time_val,
-                            top_val,
-                            bot_val,
-                            self.inputs.structure_util.oteclr,
-                            text="Golden zone",
-                            text_color=self.inputs.structure_util.oteclr,
-                            event_time=int(time_val),
+                    self._remove_golden_zone_box(current_box, reset_direction=True)
+                    current_box = None
+            ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", structure_util_inputs.ote1)
+            ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", structure_util_inputs.ote2)
+            previous_oi1 = self.prev_oi1
+            oi1_value: Optional[int] = None
+            if oi1 is not None and not math.isnan(oi1):
+                oi1_value = int(oi1)
+                top_val = ot if isinstance(ot, (int, float)) and not math.isnan(ot) else self.series.get("high")
+                bot_val = ob if isinstance(ob, (int, float)) and not math.isnan(ob) else self.series.get("low")
+                top_val = top_val if isinstance(top_val, (int, float)) else math.nan
+                bot_val = bot_val if isinstance(bot_val, (int, float)) else math.nan
+                if not math.isnan(top_val) and not math.isnan(bot_val):
+                    should_manage = self.bxty != 0 or previous_oi1 is None or oi1_value != previous_oi1
+                    if should_manage:
+                        identity = self._compute_golden_zone_identity(oi1_value, top_val, bot_val)
+                        current_identity = (
+                            self._golden_zone_lookup.get(id(current_box)) if isinstance(current_box, Box) else None
                         )
-                        self.bxf = new_box
-                        self._register_golden_zone_tracker(new_box, identity, int(time_val))
-                        self.bxty = 1 if dir_up else -1
-                    else:
-                        self.bxf = None
-                        self.bxty = 0
-                else:
-                    assert isinstance(current_box, Box)
-                    current_box.set_lefttop(oi1_int, top_val)
-                    current_box.set_rightbottom(time_val, bot_val)
-                    current_box.set_bgcolor(self.inputs.structure_util.oteclr)
-                    current_box.set_border_color(self.inputs.structure_util.oteclr)
-                    current_box.set_text("Golden zone")
-                    current_box.set_text_color(self.inputs.structure_util.oteclr)
-                    if identity is not None:
-                        self._register_golden_zone_tracker(current_box, identity, int(time_val))
-                    self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = oi1_int
-            else:
-                self.prev_oi1 = None
+                        needs_new_box = (
+                            not isinstance(current_box, Box)
+                            or current_identity is None
+                            or identity is None
+                            or identity != current_identity
+                        )
+                        if needs_new_box:
+                            if isinstance(current_box, Box):
+                                self._remove_golden_zone_box(current_box)
+                            current_box = None
+                            if identity is not None:
+                                new_box = self.box_new(
+                                    oi1_value,
+                                    time_val,
+                                    top_val,
+                                    bot_val,
+                                    structure_util_inputs.oteclr,
+                                    text="Golden zone",
+                                    text_color=structure_util_inputs.oteclr,
+                                    event_time=int(time_val),
+                                )
+                                self.bxf = new_box
+                                current_box = new_box
+                                self._register_golden_zone_tracker(new_box, identity, int(time_val))
+                            else:
+                                self.bxf = None
+                                self.bxty = 0
+                        if isinstance(current_box, Box) and identity is not None:
+                            current_box.set_lefttop(oi1_value, top_val)
+                            current_box.set_rightbottom(time_val, bot_val)
+                            current_box.set_bgcolor(structure_util_inputs.oteclr)
+                            current_box.set_border_color(structure_util_inputs.oteclr)
+                            current_box.set_text("Golden zone")
+                            current_box.set_text_color(structure_util_inputs.oteclr)
+                            self._register_golden_zone_tracker(current_box, identity, int(time_val))
+                            self.bxty = 1 if dir_up else -1
+            self.prev_oi1 = oi1_value
+            self._evaluate_golden_zone_touches(high, low, time_val)
         else:
             self._remove_golden_zone_box(self.bxf, reset_direction=True)
             self.prev_oi1 = None
-
-        self._evaluate_golden_zone_touches(high, low, time_val)
+            self._golden_zone_tracking.clear()
+            self._golden_zone_lookup.clear()
+            self._clear_inactive_golden_zone_console_event()
         self._sync_state_mirrors()
 
 
