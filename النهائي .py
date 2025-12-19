@@ -107,6 +107,18 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+# ----------------------------------------------------------------------------
+# Scanner parameters (ICT 2022 Model)
+# ----------------------------------------------------------------------------
+SCAN_MODE = "SETUP"  # {"SETUP", "ENTRY"}
+ENTRY_MODE = "TOUCH"  # {"TOUCH", "MIDPOINT", "FULL_FILL"}
+MAX_SETUP_AGE_BARS = 100
+DISP_ATR_K = 1.5
+DISP_BODY_RATIO = 0.6
+FVG_MAX_AGE_BARS = 50
+VERBOSE = False
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
@@ -1351,6 +1363,7 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.event_log: List[Dict[str, Any]] = []
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -2076,6 +2089,7 @@ class SmartMoneyAlgoProE5:
                 {"time": time_val, "color": color}
                 for time_val, color in self.bar_colors
             ],
+            "event_log": list(self.event_log),
             "condition_trace": [
                 {
                     "name": evaluation.spec.name,
@@ -3174,6 +3188,17 @@ class SmartMoneyAlgoProE5:
         )
         ln.set_style("line.style_dashed" if dashed else "line.style_solid")
         ln.set_color(color)
+        normalized = text.strip().upper()
+        if normalized.startswith("MSS"):
+            self._log_event(
+                "mss",
+                {
+                    "direction": "bullish" if down else "bearish",
+                    "break_price": y,
+                    "time": target_time,
+                    "internal_or_external": "internal" if dashed else "external",
+                },
+            )
 
     def _update_timediff(self, time_val: int) -> None:
         self.time_history.append(time_val)
@@ -3183,6 +3208,11 @@ class SmartMoneyAlgoProE5:
             diff = self.time_history[-1] - self.time_history[-101]
             if diff > 0:
                 self.timediff_value = diff / 100.0
+
+    def _log_event(self, name: str, payload: Dict[str, Any]) -> None:
+        """Append a structured event without affecting indicator logic."""
+        item = {"name": name, **payload}
+        self.event_log.append(item)
         elif len(self.time_history) > 1:
             diff = self.time_history[-1] - self.time_history[-2]
             if diff > 0:
@@ -3320,6 +3350,15 @@ class SmartMoneyAlgoProE5:
                 array.remove(i)
                 self._delete_line(line_obj)
                 mitigated = True
+                self._log_event(
+                    "liquidity_sweep",
+                    {
+                        "direction": "bearish" if is_high else "bullish",
+                        "type": "buyside" if is_high else "sellside",
+                        "swept_level_price": trigger,
+                        "time": self.series.get_time(),
+                    },
+                )
                 if liq.mitiOptions == "Show":
                     color = liq.highLineColorHTF if is_high else liq.lowLineColorHTF
                     style = self._map_line_style(liq._highLineStyleHTF)
@@ -3353,6 +3392,15 @@ class SmartMoneyAlgoProE5:
                 array.remove(i)
                 self._delete_box(box_obj)
                 mitigated = True
+                self._log_event(
+                    "liquidity_sweep",
+                    {
+                        "direction": "bearish" if is_high else "bullish",
+                        "type": "buyside" if is_high else "sellside",
+                        "swept_level_price": trigger,
+                        "time": self.series.get_time(),
+                    },
+                )
                 if liq.mitiOptions == "Show":
                     color = liq.highBoxBorderColorHTF if is_high else liq.lowBoxBorderColorHTF
                     bgcolor = liq.highLineColorHTF if is_high else liq.lowLineColorHTF
@@ -5131,6 +5179,20 @@ class SmartMoneyAlgoProE5:
             self.fvg_removed = 1
         if removed_bear == -1:
             self.fvg_removed = -1 if self.fvg_removed == 0 else self.fvg_removed
+
+        if self.fvg_gap in (1, -1):
+            holder = self.bullish_gap_holder if self.fvg_gap == 1 else self.bearish_gap_holder
+            if holder.size() > 0:
+                box_obj: Box = holder.get(holder.size() - 1)
+                self._log_event(
+                    "fvg_created",
+                    {
+                        "direction": "bullish" if self.fvg_gap == 1 else "bearish",
+                        "fvg_low": box_obj.get_bottom(),
+                        "fvg_high": box_obj.get_top(),
+                        "created_time": box_obj.get_left(),
+                    },
+                )
 
         self._fvg_trim(self.bullish_gap_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_gap_fill_holder, fvg.max_fvg)
@@ -7311,3 +7373,221 @@ class SmartMoneyAlgoProE5:
 
         self._evaluate_golden_zone_touches(high, low, time_val)
         self._sync_state_mirrors()
+
+
+# ----------------------------------------------------------------------------
+# ICT 2022 Scanner (state-driven, no alertcondition dependency)
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class ICTMatch:
+    symbol: str
+    direction: str
+    mode: str
+    last_bar_time: int
+    sweep: Dict[str, Any]
+    mss: Dict[str, Any]
+    displacement: Dict[str, Any]
+    fvg: Dict[str, Any]
+    reason: str
+
+
+def _bar_index_from_time(series: SeriesAccessor, time_val: int) -> Optional[int]:
+    for idx in range(len(series.time) - 1, -1, -1):
+        if series.time[idx] == time_val:
+            return idx
+    return None
+
+
+def _atr_at_index(series: SeriesAccessor, index: int, length: int = 14) -> float:
+    total = 0.0
+    count = 0
+    for i in range(index, max(index - length, 0), -1):
+        if i - 1 < 0:
+            break
+        high = series.high[i]
+        low = series.low[i]
+        prev_close = series.close[i - 1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        total += tr
+        count += 1
+    return total / count if count else 0.0
+
+
+def _body_ratio(series: SeriesAccessor, index: int) -> float:
+    high = series.high[index]
+    low = series.low[index]
+    body = abs(series.close[index] - series.open[index])
+    candle_range = max(high - low, 1e-12)
+    return body / candle_range
+
+
+def _find_latest_event(
+    events: List[Dict[str, Any]],
+    name: str,
+    *,
+    direction: Optional[str] = None,
+    max_time: Optional[int] = None,
+    min_time: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    for evt in reversed(events):
+        if evt.get("name") != name:
+            continue
+        if direction and evt.get("direction") != direction:
+            continue
+        time_val = evt.get("time") or evt.get("created_time")
+        if max_time is not None and time_val and time_val > max_time:
+            continue
+        if min_time is not None and time_val and time_val < min_time:
+            continue
+        return evt
+    return None
+
+
+def evaluate_ict2022(
+    symbol: str,
+    runtime: SmartMoneyAlgoProE5,
+    snapshot: Dict[str, Any],
+    params: Optional[Dict[str, Any]] = None,
+) -> Optional[ICTMatch]:
+    cfg = {
+        "scan_mode": SCAN_MODE,
+        "entry_mode": ENTRY_MODE,
+        "max_setup_age_bars": MAX_SETUP_AGE_BARS,
+        "disp_atr_k": DISP_ATR_K,
+        "disp_body_ratio": DISP_BODY_RATIO,
+        "fvg_max_age_bars": FVG_MAX_AGE_BARS,
+        "verbose": VERBOSE,
+    }
+    if params:
+        cfg.update(params)
+
+    series = runtime.series
+    last_index = series.length() - 1
+    last_time = series.get_time()
+    events = snapshot.get("event_log", [])
+
+    max_age_time = None
+    if last_index >= 0:
+        min_index = max(0, last_index - int(cfg["max_setup_age_bars"]))
+        max_age_time = series.time[min_index]
+
+    sweep = _find_latest_event(
+        events,
+        "liquidity_sweep",
+        min_time=max_age_time,
+    )
+    if not sweep:
+        return None
+
+    sweep_time = sweep.get("time")
+    sweep_idx = _bar_index_from_time(series, sweep_time) if sweep_time else None
+    if sweep_idx is None:
+        return None
+
+    direction = sweep.get("direction")
+    mss = _find_latest_event(
+        events,
+        "mss",
+        direction=direction,
+        min_time=sweep_time,
+    )
+    if not mss:
+        return None
+
+    mss_time = mss.get("time")
+    mss_idx = _bar_index_from_time(series, mss_time) if mss_time else None
+    if mss_idx is None or mss_idx < sweep_idx:
+        return None
+
+    disp_event = None
+    for idx in range(mss_idx, last_index + 1):
+        atr = _atr_at_index(series, idx)
+        body = abs(series.close[idx] - series.open[idx])
+        ratio = _body_ratio(series, idx)
+        if (atr and body >= cfg["disp_atr_k"] * atr) or ratio >= cfg["disp_body_ratio"]:
+            disp_event = {
+                "disp_time": series.time[idx],
+                "disp_range": series.high[idx] - series.low[idx],
+                "disp_atr_ratio": body / atr if atr else 0.0,
+                "index": idx,
+            }
+            break
+    if not disp_event:
+        return None
+
+    disp_time = disp_event["disp_time"]
+    fvg = _find_latest_event(
+        events,
+        "fvg_created",
+        direction=direction,
+        min_time=disp_time,
+    )
+    if not fvg:
+        return None
+
+    fvg_time = fvg.get("created_time")
+    fvg_idx = _bar_index_from_time(series, fvg_time) if fvg_time else None
+    if fvg_idx is None or (last_index - fvg_idx) > cfg["fvg_max_age_bars"]:
+        return None
+
+    fvg_low = float(fvg["fvg_low"])
+    fvg_high = float(fvg["fvg_high"])
+    if cfg["scan_mode"].upper() == "ENTRY":
+        current_high = series.get("high")
+        current_low = series.get("low")
+        current_close = series.get("close")
+        midpoint = (fvg_low + fvg_high) / 2.0
+        touched = False
+        if cfg["entry_mode"] == "TOUCH":
+            touched = current_low <= fvg_high and current_high >= fvg_low
+        elif cfg["entry_mode"] == "MIDPOINT":
+            touched = current_low <= midpoint <= current_high
+        elif cfg["entry_mode"] == "FULL_FILL":
+            touched = fvg_low <= current_close <= fvg_high
+        if not touched:
+            return None
+
+    reason = "sweep -> mss -> displacement -> fvg"
+    return ICTMatch(
+        symbol=symbol,
+        direction=direction,
+        mode=cfg["scan_mode"],
+        last_bar_time=last_time,
+        sweep=sweep,
+        mss=mss,
+        displacement=disp_event,
+        fvg=fvg,
+        reason=reason,
+    )
+
+
+def scan_symbols(
+    symbols: Dict[str, List[Dict[str, float]]],
+    *,
+    params: Optional[Dict[str, Any]] = None,
+) -> List[ICTMatch]:
+    matches: List[ICTMatch] = []
+    for symbol, candles in symbols.items():
+        runtime = SmartMoneyAlgoProE5(base_timeframe="")
+        runtime.process(candles)
+        snapshot = runtime.snapshot_state()
+        match = evaluate_ict2022(symbol, runtime, snapshot, params=params)
+        if match:
+            matches.append(match)
+        elif params and params.get("verbose"):
+            print(f"[{symbol}] no match")
+
+    print(f"FOUND {len(matches)} MATCHES")
+    for match in matches:
+        sweep_time = match.sweep.get("time")
+        mss_time = match.mss.get("time")
+        fvg_low = match.fvg.get("fvg_low")
+        fvg_high = match.fvg.get("fvg_high")
+        print(
+            f"{match.symbol} | {match.direction} | {match.mode} | "
+            f"SWEEP@{sweep_time} | MSS@{mss_time} | FVG[{fvg_low}-{fvg_high}] | "
+            f"LAST_BAR_TIME {match.last_bar_time}"
+        )
+    return matches
