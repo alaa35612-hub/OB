@@ -3208,17 +3208,17 @@ class SmartMoneyAlgoProE5:
             diff = self.time_history[-1] - self.time_history[-101]
             if diff > 0:
                 self.timediff_value = diff / 100.0
-
-    def _log_event(self, name: str, payload: Dict[str, Any]) -> None:
-        """Append a structured event without affecting indicator logic."""
-        item = {"name": name, **payload}
-        self.event_log.append(item)
         elif len(self.time_history) > 1:
             diff = self.time_history[-1] - self.time_history[-2]
             if diff > 0:
                 self.timediff_value = float(diff)
         if self.timediff_value == 0.0:
             self.timediff_value = float(self.curTf)
+
+    def _log_event(self, name: str, payload: Dict[str, Any]) -> None:
+        """Append a structured event without affecting indicator logic."""
+        item = {"name": name, **payload}
+        self.event_log.append(item)
 
     def _timediff(self) -> float:
         return self.timediff_value if self.timediff_value > 0 else float(self.curTf)
