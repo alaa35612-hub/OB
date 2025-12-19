@@ -10387,12 +10387,19 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
     return list(dict.fromkeys(filtered))
 
 # ---------- Android CLI entry ----------
-def _android_cli_entry() -> int:
+def _android_cli_entry(
+    *,
+    strategy_overlay: bool = False,
+    overlay_strategy: Optional[str] = None,
+) -> int:
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
+    overlay_strategy = overlay_strategy or "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays"
+    overlay_cooldown_store: Dict[Tuple[str, str, str], int] = {}
+    tf_seconds = _timeframe_to_seconds(args.timeframe) or 60
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
@@ -10503,6 +10510,26 @@ def _android_cli_entry() -> int:
                     _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
                     alerts_total += len(recent_alerts)
 
+                if strategy_overlay:
+                    last_ts = candles[-1][0] if candles else None
+                    if last_ts:
+                        engine = _StrategyEngine(
+                            runtime,
+                            sym,
+                            equity=DEFAULT_EQUITY,
+                            risk_pct=DEFAULT_RISK,
+                            ny_offset=DEFAULT_NY_OFFSET,
+                            cooldown_store=overlay_cooldown_store,
+                        )
+                        engine.bar_index_override = int(last_ts // (tf_seconds * 1000))
+                        signals = engine.evaluate(overlay_strategy)
+                        if signals:
+                            signal_lines = [
+                                f"{sig.strategy} {sig.side} @ {_fmt(sig.entry)} SL {_fmt(sig.stop)}"
+                                for sig in signals
+                            ]
+                            print(f"Strategy Signals: {' | '.join(signal_lines)}")
+
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
 
@@ -10526,32 +10553,7 @@ def _android_cli_entry() -> int:
 
 # ---------- Router ----------
 def __router_main__():
-    if len(sys.argv) == 1:
-        defaults = EDITOR_AUTORUN_DEFAULTS
-        sys.argv += [
-            "-t", defaults.timeframe,
-            "-l", str(defaults.candle_limit),
-            "--max-symbols", str(defaults.max_symbols),
-            "--recent", str(defaults.recent_bars),
-            "--verbose",
-        ]
-        if defaults.height_threshold is not None:
-            sys.argv += ["--min-change", str(defaults.height_threshold)]
-        if defaults.height_candle_window is not None:
-            sys.argv += ["--height-candles", str(defaults.height_candle_window)]
-        if defaults.height_scope:
-            sys.argv += ["--height-scope", str(defaults.height_scope)]
-        if defaults.height_metric:
-            sys.argv += ["--height-metric", str(defaults.height_metric)]
-        if defaults.continuous_scan:
-            sys.argv.append("--continuous")
-        if defaults.scan_interval > 0:
-            sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
-    return _android_cli_entry()
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
+    return main()
 
 
 # ============================================================================
@@ -10666,6 +10668,46 @@ class _IndicatorAPI:
         return self.Klass()
 
 
+def _build_strategy_inputs(force_compute: bool) -> Optional[Any]:
+    """Create IndicatorInputs with optional overrides to force PD arrays computation."""
+    mod = sys.modules.get(__name__)
+    inputs_ctor = getattr(mod, "IndicatorInputs", None)
+    if inputs_ctor is None:
+        return None
+    inputs = inputs_ctor()
+    if force_compute:
+        try:
+            if hasattr(inputs, "demand_supply"):
+                inputs.demand_supply.show_order_blocks = True
+            if hasattr(inputs, "fvg"):
+                inputs.fvg.show_fvg = True
+            if hasattr(inputs, "liquidity"):
+                inputs.liquidity.currentTF = True
+            if hasattr(inputs, "structure"):
+                inputs.structure.showSMC = True
+        except Exception:
+            pass
+    return inputs
+
+
+def _strategy_debug_counts(rt: Any, events: Dict[str, Any]) -> Dict[str, int]:
+    def _size(obj: Any) -> int:
+        try:
+            return int(obj.size())
+        except Exception:
+            return 0
+    counts = {
+        "count_FVG_up": _size(getattr(rt, "bullish_gap_holder", None)),
+        "count_FVG_down": _size(getattr(rt, "bearish_gap_holder", None)),
+        "count_OB_demand": _size(getattr(rt, "demandZone", None)),
+        "count_OB_supply": _size(getattr(rt, "supplyZone", None)),
+        "count_BOS": 1 if "BOS" in events else 0,
+        "count_CHOCH": 1 if "CHOCH" in events else 0,
+        "count_MSS": 1 if "MSS" in events else 0,
+    }
+    return counts
+
+
 # ---------------------- محرّك الاستراتيجيات (Top 10 ICT) ----------------------
 @dataclass
 class _Signal:
@@ -10768,6 +10810,81 @@ def _last_ob_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _last_fvg_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
+    """Return latest FVG bounds (low, high) for the requested side if available."""
+    holder = getattr(rt, "bullish_gap_holder" if bullish else "bearish_gap_holder", None)
+    try:
+        if holder and holder.size() > 0:
+            box = holder.get(holder.size() - 1)
+            top = getattr(box, "get_top", lambda: None)()
+            bottom = getattr(box, "get_bottom", lambda: None)()
+            if top is not None and bottom is not None:
+                lo, hi = (float(bottom), float(top))
+                return (min(lo, hi), max(lo, hi))
+    except Exception:
+        pass
+    return None
+
+
+def _series_len(rt: Any) -> int:
+    try:
+        if hasattr(rt, "series"):
+            return int(rt.series.length())
+    except Exception:
+        pass
+    return 0
+
+
+def _atr_value(rt: Any, length: int = 14) -> float:
+    """Fetch ATR from runtime if available, otherwise fall back to current range."""
+    try:
+        if hasattr(rt, "_atr"):
+            atr = float(rt._atr(length))
+            if atr == atr:
+                return atr
+    except Exception:
+        pass
+    high = _series_get(rt, "high", 0)
+    low = _series_get(rt, "low", 0)
+    return abs(high - low)
+
+
+def _collect_swing_levels(rt: Any, bullish: bool, lookback: int) -> List[float]:
+    """Collect recent swing highs/lows from the swing label arrays."""
+    levels: List[float] = []
+    arr = getattr(rt, "swingHighArr" if bullish else "swingLowArr", None)
+    if arr is not None:
+        try:
+            size = arr.size()
+            for i in range(size - 1, max(-1, size - lookback) - 1, -1):
+                lbl = arr.get(i)
+                if lbl is not None and getattr(lbl, "y", None) is not None:
+                    levels.append(float(lbl.y))
+        except Exception:
+            pass
+    if not levels:
+        val = getattr(rt, "swingHighVal" if bullish else "swingLowVal", NA)
+        try:
+            if val == val:
+                levels.append(float(val))
+        except Exception:
+            pass
+    return levels
+
+
+def _touches_zone(high: float, low: float, zone: Tuple[float, float], tolerance: float) -> bool:
+    """Check if candle range intersects zone with tolerance (points or percent)."""
+    lo, hi = zone
+    if tolerance <= 0:
+        tol = 0.0
+    elif tolerance < 1:
+        # Treat small values as percentage of price.
+        tol = abs((high + low) / 2.0) * tolerance
+    else:
+        tol = tolerance
+    return (low <= hi + tol) and (high >= lo - tol)
+
+
 def _dir_from(events: Dict[str, Any], key: str) -> Optional[str]:
     v = events.get(key, {})
     d = v.get("direction")
@@ -10788,12 +10905,34 @@ def _swept_against_pdh_pdl(rt: Any) -> Optional[str]:
 
 
 class _StrategyEngine:
-    def __init__(self, rt: Any, symbol: str, *, equity: float, risk_pct: float, ny_offset: int) -> None:
+    def __init__(
+        self,
+        rt: Any,
+        symbol: str,
+        *,
+        equity: float,
+        risk_pct: float,
+        ny_offset: int,
+        cooldown_store: Optional[Dict[Tuple[str, str, str], int]] = None,
+    ) -> None:
         self.rt = rt
         self.symbol = symbol
         self.equity = equity
         self.risk_pct = risk_pct
         self.ny_offset = ny_offset
+        self._lrmd_state: Dict[str, Any] = {
+            "raid_dir": None,
+            "raid_index": None,
+            "raid_level": None,
+            "raid_high": None,
+            "raid_low": None,
+            "displacement_index": None,
+            "mss_index": None,
+        }
+        self._signal_cooldown: Dict[Tuple[str, str, str], int] = cooldown_store or {}
+        self.last_debug: Dict[str, Any] = {}
+        self.bar_index_override: Optional[int] = None
+        self.signal_cooldown_bars: int = 20
 
     def _print(self, sig: _Signal) -> None:
         size = _pos_size(self.equity, self.risk_pct, sig.entry, sig.stop)
@@ -10801,9 +10940,51 @@ class _StrategyEngine:
         print(f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
               f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
 
-    def evaluate_and_print(self, name: str) -> None:
+    def _current_bar_index(self) -> int:
+        if self.bar_index_override is not None:
+            return int(self.bar_index_override)
+        return _series_len(self.rt) - 1
+
+    def evaluate(self, name: str) -> List[_Signal]:
+        bar_index = self._current_bar_index()
+        if (name or "").strip().upper() == "ALL":
+            signals: List[_Signal] = []
+            for strat in self.available_strategies():
+                sig = self._evaluate(strat)
+                if sig and self._cooldown_allows(sig, bar_index, self.signal_cooldown_bars):
+                    signals.append(sig)
+            return signals
         sig = self._evaluate(name)
-        if sig:
+        if sig and self._cooldown_allows(sig, bar_index, self.signal_cooldown_bars):
+            return [sig]
+        return []
+
+    def available_strategies(self) -> List[str]:
+        return [
+            "ICT 2022",
+            "Silver Bullet",
+            "Judas Swing",
+            "Turtle Soup",
+            "OTE",
+            "PO3",
+            "Liquidity Sweep + OB",
+            "Breaker Block",
+            "FVG Continuation",
+            "OSOK",
+            "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays",
+        ]
+
+    def _cooldown_allows(self, sig: _Signal, idx: int, cooldown_bars: int) -> bool:
+        """Prevent duplicate signals within cooldown bars."""
+        key = (sig.symbol, sig.strategy, sig.side)
+        last_idx = self._signal_cooldown.get(key)
+        if last_idx is not None and idx - last_idx < cooldown_bars:
+            return False
+        self._signal_cooldown[key] = idx
+        return True
+
+    def evaluate_and_print(self, name: str) -> None:
+        for sig in self.evaluate(name):
             self._print(sig)
 
     # ----------------- استراتيجيات (نسخة خفيفة) -----------------
@@ -10832,6 +11013,8 @@ class _StrategyEngine:
             if sig:
                 sig.strategy = "OSOK"
             return sig
+        if name == "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays":
+            return self._daily_bias_dol_raid_displacement_mss_pd()
         return None
 
     def _ict_2022(self, require_killzone: bool = False) -> Optional[_Signal]:
@@ -10973,6 +11156,241 @@ class _StrategyEngine:
             return _Signal(self.symbol, "SELL", price, price + 0.001*price, "FVG Continuation", t, "trend↓ + bearish FVG")
         return None
 
+    def _daily_bias_dol_raid_displacement_mss_pd(self) -> Optional[_Signal]:
+        """Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays strategy."""
+        # -------------------- Parameters (tweakable) --------------------
+        use_pdh_pdl_only = False
+        liquidity_lookback = 3
+        raid_reclaim_max_bars = 1
+        displacement_atr_mult = 1.5
+        range_mult = 1.5
+        displacement_max_bars_after_raid = 2
+        mss_max_bars_after_raid = 10
+        require_retrace_to_zone = True
+        retrace_tolerance = 0.0
+        prefer_fvg_over_ob = True
+        stop_use_raid_extreme = True
+
+        ev = _extract_events(self.rt)
+        t = _last_time(self.rt)
+        idx = self.bar_index_override if self.bar_index_override is not None else (_series_len(self.rt) - 1)
+        price = _series_get(self.rt, "close", 0)
+        open_ = _series_get(self.rt, "open", 0)
+        high = _series_get(self.rt, "high", 0)
+        low = _series_get(self.rt, "low", 0)
+
+        def _debug_return(**flags: Any) -> Optional[_Signal]:
+            self.last_debug = {"strategy": "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays", **flags}
+            return None
+
+        # -------------------- (A) Daily Bias / Draw on Liquidity --------------------
+        pdh, pdl = _pdh_pdl(self.rt)
+        above_levels: List[float] = []
+        below_levels: List[float] = []
+        if pdh is not None:
+            above_levels.append(pdh)
+        if pdl is not None:
+            below_levels.append(pdl)
+        if not use_pdh_pdl_only:
+            above_levels.extend(_collect_swing_levels(self.rt, True, liquidity_lookback))
+            below_levels.extend(_collect_swing_levels(self.rt, False, liquidity_lookback))
+        above_levels = [lvl for lvl in above_levels if lvl > price]
+        below_levels = [lvl for lvl in below_levels if lvl < price]
+        closest_above = min(above_levels, key=lambda v: abs(v - price), default=None)
+        closest_below = min(below_levels, key=lambda v: abs(v - price), default=None)
+        liquidity_target = None
+        bias = None
+        if closest_above is not None and closest_below is not None:
+            if abs(closest_above - price) <= abs(price - closest_below):
+                liquidity_target = closest_above
+                bias = "bullish"
+            else:
+                liquidity_target = closest_below
+                bias = "bearish"
+        elif closest_above is not None:
+            liquidity_target = closest_above
+            bias = "bullish"
+        elif closest_below is not None:
+            liquidity_target = closest_below
+            bias = "bearish"
+        _ = (liquidity_target, bias)  # variables retained for transparency/debugging
+        bias_ready = liquidity_target is not None and bias is not None
+
+        # -------------------- (B) Liquidity Raid (Stop Hunt) --------------------
+        raid_dir = None
+        raid_level = None
+        raid_high = None
+        raid_low = None
+        raid_index = None
+
+        def _bearish_raid(level: float) -> Optional[Tuple[int, float, float]]:
+            # Bearish raid: sweep above level then close back below (same/next bar).
+            for offset in range(0, raid_reclaim_max_bars + 1):
+                h = _series_get(self.rt, "high", offset)
+                c = _series_get(self.rt, "close", offset)
+                if h > level:
+                    reclaim_now = _series_get(self.rt, "close", 0) < level
+                    reclaim_same = c < level
+                    if reclaim_now or reclaim_same:
+                        return (offset, h, _series_get(self.rt, "low", offset))
+            return None
+
+        def _bullish_raid(level: float) -> Optional[Tuple[int, float, float]]:
+            # Bullish raid: sweep below level then close back above (same/next bar).
+            for offset in range(0, raid_reclaim_max_bars + 1):
+                l = _series_get(self.rt, "low", offset)
+                c = _series_get(self.rt, "close", offset)
+                if l < level:
+                    reclaim_now = _series_get(self.rt, "close", 0) > level
+                    reclaim_same = c > level
+                    if reclaim_now or reclaim_same:
+                        return (offset, _series_get(self.rt, "high", offset), l)
+            return None
+
+        if closest_above is not None:
+            raid = _bearish_raid(closest_above)
+            if raid is not None:
+                offset, r_high, r_low = raid
+                raid_dir = "bearish"
+                raid_level = closest_above
+                raid_high = r_high
+                raid_low = r_low
+                raid_index = idx - offset
+        if raid_dir is None and closest_below is not None:
+            raid = _bullish_raid(closest_below)
+            if raid is not None:
+                offset, r_high, r_low = raid
+                raid_dir = "bullish"
+                raid_level = closest_below
+                raid_high = r_high
+                raid_low = r_low
+                raid_index = idx - offset
+
+        if raid_dir is not None:
+            # Cache latest raid info.
+            self._lrmd_state.update(
+                raid_dir=raid_dir,
+                raid_index=raid_index,
+                raid_level=raid_level,
+                raid_high=raid_high,
+                raid_low=raid_low,
+                displacement_index=None,
+                mss_index=None,
+            )
+        else:
+            # Clear stale state if timing window expired.
+            last_raid_idx = self._lrmd_state.get("raid_index")
+            if last_raid_idx is not None and idx - last_raid_idx > mss_max_bars_after_raid:
+                self._lrmd_state.update(
+                    raid_dir=None,
+                    raid_index=None,
+                    raid_level=None,
+                    raid_high=None,
+                    raid_low=None,
+                    displacement_index=None,
+                    mss_index=None,
+                )
+
+        raid_dir = self._lrmd_state.get("raid_dir")
+        raid_index = self._lrmd_state.get("raid_index")
+        if raid_dir is None or raid_index is None:
+            return _debug_return(bias_ready=bias_ready, raid_found=False)
+
+        # -------------------- (C) Displacement --------------------
+        if self._lrmd_state.get("displacement_index") is None:
+            atr = _atr_value(self.rt, 14)
+            body = abs(price - open_)
+            candle_range = abs(high - low)
+            displacement = body >= atr * displacement_atr_mult or candle_range >= atr * range_mult
+            dir_ok = (raid_dir == "bearish" and price < open_) or (raid_dir == "bullish" and price > open_)
+            if displacement and dir_ok and (idx - raid_index <= displacement_max_bars_after_raid):
+                self._lrmd_state["displacement_index"] = idx
+
+        if self._lrmd_state.get("displacement_index") is None:
+            return _debug_return(bias_ready=bias_ready, raid_found=True, displacement_ok=False)
+
+        # -------------------- (D) MSS/CHOCH/BOS --------------------
+        if self._lrmd_state.get("mss_index") is None:
+            mss_dir = _dir_from(ev, "MSS") or _dir_from(ev, "CHOCH") or _dir_from(ev, "BOS")
+            expected = "bearish" if raid_dir == "bearish" else "bullish"
+            if mss_dir == expected and idx - raid_index <= mss_max_bars_after_raid:
+                self._lrmd_state["mss_index"] = idx
+
+        if self._lrmd_state.get("mss_index") is None:
+            return _debug_return(
+                bias_ready=bias_ready,
+                raid_found=True,
+                displacement_ok=True,
+                mss_ok=False,
+            )
+
+        # -------------------- (E) Retracement to PD Arrays --------------------
+        bullish = raid_dir == "bullish"
+        fvg_zone = _last_fvg_zone(self.rt, bullish)
+        ob_zone = _last_ob_zone(self.rt, bullish)
+        zone = None
+        zone_label = None
+        if prefer_fvg_over_ob and fvg_zone is not None:
+            zone = fvg_zone
+            zone_label = "FVG"
+        elif ob_zone is not None:
+            zone = ob_zone
+            zone_label = "OB"
+        elif fvg_zone is not None:
+            zone = fvg_zone
+            zone_label = "FVG"
+
+        if require_retrace_to_zone and zone is None:
+            return _debug_return(
+                bias_ready=bias_ready,
+                raid_found=True,
+                displacement_ok=True,
+                mss_ok=True,
+                zone_found=False,
+            )
+
+        touched = True
+        if require_retrace_to_zone and zone is not None:
+            touched = _touches_zone(high, low, zone, retrace_tolerance)
+        if not touched:
+            return _debug_return(
+                bias_ready=bias_ready,
+                raid_found=True,
+                displacement_ok=True,
+                mss_ok=True,
+                zone_found=True,
+                retrace_hit=False,
+            )
+
+        # -------------------- (F) Signal / Stop / Target --------------------
+        if bullish:
+            stop = (self._lrmd_state.get("raid_low") if stop_use_raid_extreme else (zone[0] if zone else low))
+            target_level = closest_above
+            reason = f"raid✓ + displacement✓ + MSS✓ + retrace {zone_label or 'zone'}"
+            if target_level is not None:
+                reason += f" + target {_fmt(float(target_level))}"
+            sig = _Signal(self.symbol, "BUY", price, float(stop),
+                          "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays", t, reason)
+        else:
+            stop = (self._lrmd_state.get("raid_high") if stop_use_raid_extreme else (zone[1] if zone else high))
+            target_level = closest_below
+            reason = f"raid✓ + displacement✓ + MSS✓ + retrace {zone_label or 'zone'}"
+            if target_level is not None:
+                reason += f" + target {_fmt(float(target_level))}"
+            sig = _Signal(self.symbol, "SELL", price, float(stop),
+                          "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays", t, reason)
+
+        self.last_debug = {
+            "strategy": "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays",
+            "bias_ready": bias_ready,
+            "raid_found": True,
+            "displacement_ok": True,
+            "mss_ok": True,
+            "zone_found": True,
+            "retrace_hit": True,
+        }
+        return sig
+
 
 # ---------------------- محرّك التشغيل (باكتيست/حي) ----------------------
 @dataclass
@@ -11060,7 +11478,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ICT Strategy Runner (Integrated, text-only)")
     p.add_argument("--strategy", default=DEFAULT_STRATEGY,
                    choices=["ICT 2022","Silver Bullet","Judas Swing","Turtle Soup","OTE","PO3",
-                            "Liquidity Sweep + OB","Breaker Block","FVG Continuation","OSOK"],
+                            "Liquidity Sweep + OB","Breaker Block","FVG Continuation","OSOK",
+                            "Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays"],
                    help="الاستراتيجية المفعلة")
     p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="قائمة رموز مفصولة بفواصل (USDT-M)")
     p.add_argument("--start", default=DEFAULT_START, help="YYYY-MM-DD")
@@ -11096,8 +11515,177 @@ def _main(argv: Optional[List[str]] = None) -> None:
     else:
         eng.run_backtest()
 
+# ---------------------- Strategy mode runner (live polling) ----------------------
+def _parse_strategy_mode_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="ICT Strategy Runner (mode=strategy)")
+    p.add_argument("--live", action="store_true", default=False)
+    p.add_argument("--timeframe", default="1m")
+    p.add_argument("--limit", type=int, default=500)
+    p.add_argument("--poll", type=int, default=60)
+    p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="قائمة رموز مفصولة بفواصل")
+    p.add_argument(
+        "--strategy",
+        default="Daily Bias + DOL + Raid + Displacement + MSS + PD Arrays",
+        help="اسم الاستراتيجية أو ALL",
+    )
+    p.add_argument("--debug", action="store_true", default=False)
+    return p.parse_args(argv)
+
+
+def _timeframe_to_seconds(tf: str) -> Optional[int]:
+    try:
+        return _parse_timeframe_to_seconds(tf, None)
+    except Exception:
+        return None
+
+
+def _fetch_ohlcv_limit(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
+    candles = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, limit=limit)
+    return [
+        {
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]) if len(c) > 5 else 0.0,
+        }
+        for c in candles
+    ]
+
+
+def _run_strategy_mode(args: argparse.Namespace) -> int:
+    if ccxt is None:
+        print("ccxt not installed. pip install ccxt", file=sys.stderr)
+        return 2
+    api = _IndicatorAPI.discover()
+    symbols = [s.strip().upper() for s in (args.symbols or "").split(",") if s.strip()]
+    if not symbols:
+        print("لا توجد رموز للتشغيل.", file=sys.stderr)
+        return 1
+    timeframe = args.timeframe
+    tf_seconds = _timeframe_to_seconds(timeframe) or 60
+    cooldown_store: Dict[Tuple[str, str, str], int] = {}
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+
+    while True:
+        cycle_signals: List[_Signal] = []
+        last_candle_time = None
+        cycle_time = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        for sym in symbols:
+            try:
+                candles = _fetch_ohlcv_limit(exchange, sym, timeframe, int(args.limit))
+            except Exception as exc:
+                if args.debug:
+                    print(f"[{sym}] fetch error: {exc}", file=sys.stderr)
+                continue
+            if not candles:
+                continue
+            last_candle_time = candles[-1]["time"]
+            inputs = _build_strategy_inputs(force_compute=True)
+            runtime = api.Klass(inputs=inputs, base_timeframe=timeframe, recent_bars=2)
+            runtime.process(candles)
+
+            engine = _StrategyEngine(
+                runtime,
+                sym,
+                equity=DEFAULT_EQUITY,
+                risk_pct=DEFAULT_RISK,
+                ny_offset=DEFAULT_NY_OFFSET,
+                cooldown_store=cooldown_store,
+            )
+            bar_index = int(last_candle_time // (tf_seconds * 1000))
+            engine.bar_index_override = bar_index
+            signals = engine.evaluate(args.strategy)
+            if args.debug:
+                events = _extract_events(runtime)
+                counts = _strategy_debug_counts(runtime, events)
+                counts_line = " ".join(f"{k}={v}" for k, v in counts.items())
+                print(f"[{sym}] {counts_line}")
+                if all(v == 0 for v in counts.values()):
+                    print(f"[{sym}] WARN: all counters are zero; indicator computation may be disabled.")
+                if not signals:
+                    print(f"[{sym}] debug_flags={engine.last_debug}")
+            for sig in signals:
+                engine._print(sig)
+                cycle_signals.append(sig)
+
+        last_ts = (
+            dt.datetime.utcfromtimestamp(last_candle_time / 1000).strftime("%Y-%m-%d %H:%M:%S UTC")
+            if last_candle_time
+            else "—"
+        )
+        print(f"Heartbeat: time={cycle_time} symbols_count={len(symbols)} timeframe={timeframe} last_candle_time={last_ts}")
+        if not cycle_signals:
+            print("No signals this cycle")
+
+        if not args.live:
+            break
+        time.sleep(max(1, int(args.poll)))
+    return 0
+
+
+# ============================ End of Integration ============================
+
+
+def _parse_mode_args(argv: List[str]) -> Tuple[argparse.Namespace, List[str]]:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--mode", choices=["scanner", "strategy"], default="scanner")
+    p.add_argument("--strategy-overlay", action="store_true", default=False)
+    p.add_argument("--strategy", default=None)
+    return p.parse_known_args(argv)
+
+
+def _inject_scanner_defaults(argv: List[str]) -> List[str]:
+    if argv:
+        return argv
+    defaults = EDITOR_AUTORUN_DEFAULTS
+    injected = [
+        "-t", defaults.timeframe,
+        "-l", str(defaults.candle_limit),
+        "--max-symbols", str(defaults.max_symbols),
+        "--recent", str(defaults.recent_bars),
+        "--verbose",
+    ]
+    if defaults.height_threshold is not None:
+        injected += ["--min-change", str(defaults.height_threshold)]
+    if defaults.height_candle_window is not None:
+        injected += ["--height-candles", str(defaults.height_candle_window)]
+    if defaults.height_scope:
+        injected += ["--height-scope", str(defaults.height_scope)]
+    if defaults.height_metric:
+        injected += ["--height-metric", str(defaults.height_metric)]
+    if defaults.continuous_scan:
+        injected.append("--continuous")
+    if defaults.scan_interval > 0:
+        injected += ["--continuous-interval", str(defaults.scan_interval)]
+    return injected
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    mode_args, remaining = _parse_mode_args(argv)
+
+    if mode_args.mode == "strategy":
+        if mode_args.strategy is not None:
+            remaining = remaining + ["--strategy", mode_args.strategy]
+        strategy_args = _parse_strategy_mode_args(remaining)
+        symbols_line = strategy_args.symbols or ""
+        print(f"MODE=strategy timeframe={strategy_args.timeframe} symbols={symbols_line}")
+        return _run_strategy_mode(strategy_args)
+
+    remaining = _inject_scanner_defaults(remaining)
+    sys.argv = [sys.argv[0]] + remaining
+    cfg, args = _parse_args_android()
+    symbols_line = args.symbol or "AUTO"
+    print(f"MODE=scanner timeframe={args.timeframe} symbols={symbols_line}")
+    return _android_cli_entry(
+        strategy_overlay=bool(mode_args.strategy_overlay),
+        overlay_strategy=mode_args.strategy,
+    )
+
 
 if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
-# ============================ End of Integration ============================
+    main()
