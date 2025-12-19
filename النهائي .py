@@ -7591,3 +7591,18 @@ def scan_symbols(
             f"LAST_BAR_TIME {match.last_bar_time}"
         )
     return matches
+
+
+def _android_autorun() -> None:
+    """Minimal autorun hook for Android editors (run button)."""
+    runtime = SmartMoneyAlgoProE5(base_timeframe="")
+    runtime.process([])
+    print("Scanner ready. Provide OHLCV data to scan_symbols().")
+
+
+def main() -> None:
+    _android_autorun()
+
+
+if __name__ == "__main__":
+    main()
