@@ -107,6 +107,18 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+# ----------------------------------------------------------------------------
+# Scanner parameters (ICT 2022 Model)
+# ----------------------------------------------------------------------------
+SCAN_MODE = "SETUP"  # {"SETUP", "ENTRY"}
+ENTRY_MODE = "TOUCH"  # {"TOUCH", "MIDPOINT", "FULL_FILL"}
+MAX_SETUP_AGE_BARS = 100
+DISP_ATR_K = 1.5
+DISP_BODY_RATIO = 0.6
+FVG_MAX_AGE_BARS = 50
+VERBOSE = False
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
@@ -1351,6 +1363,7 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.event_log: List[Dict[str, Any]] = []
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -2076,6 +2089,7 @@ class SmartMoneyAlgoProE5:
                 {"time": time_val, "color": color}
                 for time_val, color in self.bar_colors
             ],
+            "event_log": list(self.event_log),
             "condition_trace": [
                 {
                     "name": evaluation.spec.name,
@@ -3174,6 +3188,17 @@ class SmartMoneyAlgoProE5:
         )
         ln.set_style("line.style_dashed" if dashed else "line.style_solid")
         ln.set_color(color)
+        normalized = text.strip().upper()
+        if normalized.startswith("MSS"):
+            self._log_event(
+                "mss",
+                {
+                    "direction": "bullish" if down else "bearish",
+                    "break_price": y,
+                    "time": target_time,
+                    "internal_or_external": "internal" if dashed else "external",
+                },
+            )
 
     def _update_timediff(self, time_val: int) -> None:
         self.time_history.append(time_val)
@@ -3189,6 +3214,11 @@ class SmartMoneyAlgoProE5:
                 self.timediff_value = float(diff)
         if self.timediff_value == 0.0:
             self.timediff_value = float(self.curTf)
+
+    def _log_event(self, name: str, payload: Dict[str, Any]) -> None:
+        """Append a structured event without affecting indicator logic."""
+        item = {"name": name, **payload}
+        self.event_log.append(item)
 
     def _timediff(self) -> float:
         return self.timediff_value if self.timediff_value > 0 else float(self.curTf)
@@ -3320,6 +3350,15 @@ class SmartMoneyAlgoProE5:
                 array.remove(i)
                 self._delete_line(line_obj)
                 mitigated = True
+                self._log_event(
+                    "liquidity_sweep",
+                    {
+                        "direction": "bearish" if is_high else "bullish",
+                        "type": "buyside" if is_high else "sellside",
+                        "swept_level_price": trigger,
+                        "time": self.series.get_time(),
+                    },
+                )
                 if liq.mitiOptions == "Show":
                     color = liq.highLineColorHTF if is_high else liq.lowLineColorHTF
                     style = self._map_line_style(liq._highLineStyleHTF)
@@ -3353,6 +3392,15 @@ class SmartMoneyAlgoProE5:
                 array.remove(i)
                 self._delete_box(box_obj)
                 mitigated = True
+                self._log_event(
+                    "liquidity_sweep",
+                    {
+                        "direction": "bearish" if is_high else "bullish",
+                        "type": "buyside" if is_high else "sellside",
+                        "swept_level_price": trigger,
+                        "time": self.series.get_time(),
+                    },
+                )
                 if liq.mitiOptions == "Show":
                     color = liq.highBoxBorderColorHTF if is_high else liq.lowBoxBorderColorHTF
                     bgcolor = liq.highLineColorHTF if is_high else liq.lowLineColorHTF
@@ -5131,6 +5179,20 @@ class SmartMoneyAlgoProE5:
             self.fvg_removed = 1
         if removed_bear == -1:
             self.fvg_removed = -1 if self.fvg_removed == 0 else self.fvg_removed
+
+        if self.fvg_gap in (1, -1):
+            holder = self.bullish_gap_holder if self.fvg_gap == 1 else self.bearish_gap_holder
+            if holder.size() > 0:
+                box_obj: Box = holder.get(holder.size() - 1)
+                self._log_event(
+                    "fvg_created",
+                    {
+                        "direction": "bullish" if self.fvg_gap == 1 else "bearish",
+                        "fvg_low": box_obj.get_bottom(),
+                        "fvg_high": box_obj.get_top(),
+                        "created_time": box_obj.get_left(),
+                    },
+                )
 
         self._fvg_trim(self.bullish_gap_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_gap_fill_holder, fvg.max_fvg)
@@ -7314,3790 +7376,383 @@ class SmartMoneyAlgoProE5:
 
 
 # ----------------------------------------------------------------------------
-# Binance scanner and report generation
+# ICT 2022 Scanner (state-driven, no alertcondition dependency)
 # ----------------------------------------------------------------------------
 
 
 @dataclass
-class BinanceSymbolSelection:
-    """Container describing the outcome of Binance symbol selection."""
+class ICTMatch:
+    symbol: str
+    direction: str
+    mode: str
+    last_bar_time: int
+    sweep: Dict[str, Any]
+    mss: Dict[str, Any]
+    displacement: Dict[str, Any]
+    fvg: Dict[str, Any]
+    reason: str
 
-    symbols: List[str]
-    prioritized: List[str]
-    used_height_filter: bool
-    had_prioritization_data: bool
 
-
-def _safe_symbol_metric(value: Any) -> Optional[float]:
-    """Convert metric strings such as ``"12.5%"`` into floats safely."""
-
-    if isinstance(value, (int, float)):
-        number = float(value)
-        if math.isnan(number):
-            return None
-        return number
-    if isinstance(value, str):
-        token = value.strip().rstrip("%")
-        if not token:
-            return None
-        try:
-            return float(token)
-        except ValueError:
-            return None
+def _bar_index_from_time(series: SeriesAccessor, time_val: int) -> Optional[int]:
+    for idx in range(len(series.time) - 1, -1, -1):
+        if series.time[idx] == time_val:
+            return idx
     return None
 
 
-def _ticker_metric_value(ticker: Dict[str, Any], metric: str) -> Optional[float]:
-    """Pull a metric from the CCXT ticker payload regardless of vendor keys."""
+def _atr_at_index(series: SeriesAccessor, index: int, length: int = 14) -> float:
+    total = 0.0
+    count = 0
+    for i in range(index, max(index - length, 0), -1):
+        if i - 1 < 0:
+            break
+        high = series.high[i]
+        low = series.low[i]
+        prev_close = series.close[i - 1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        total += tr
+        count += 1
+    return total / count if count else 0.0
 
-    if not isinstance(ticker, dict):
-        return None
 
-    normalized = (metric or "").strip().lower()
-    mapping: Dict[str, Tuple[str, ...]] = {
-        "percentage": ("percentage", "priceChangePercent", "P"),
-        "pricechange": ("change", "priceChange", "c"),
-        "lastprice": ("last", "close", "price"),
-    }
-    probe_keys = mapping.get(normalized, mapping["percentage"])
+def _body_ratio(series: SeriesAccessor, index: int) -> float:
+    high = series.high[index]
+    low = series.low[index]
+    body = abs(series.close[index] - series.open[index])
+    candle_range = max(high - low, 1e-12)
+    return body / candle_range
 
-    sources: List[Dict[str, Any]] = [ticker]
-    info = ticker.get("info")
-    if isinstance(info, dict):
-        sources.append(info)
 
-    for source in sources:
-        for key in probe_keys:
-            candidate = source.get(key)
-            numeric = _safe_symbol_metric(candidate)
-            if numeric is not None:
-                return numeric
+def _find_latest_event(
+    events: List[Dict[str, Any]],
+    name: str,
+    *,
+    direction: Optional[str] = None,
+    max_time: Optional[int] = None,
+    min_time: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    for evt in reversed(events):
+        if evt.get("name") != name:
+            continue
+        if direction and evt.get("direction") != direction:
+            continue
+        time_val = evt.get("time") or evt.get("created_time")
+        if max_time is not None and time_val and time_val > max_time:
+            continue
+        if min_time is not None and time_val and time_val < min_time:
+            continue
+        return evt
     return None
 
 
-def _ohlcv_metric_value(
-    candles: Sequence[Sequence[Any]],
-    metric: str,
-) -> Tuple[Optional[float], float]:
-    """Convert a slice of OHLCV rows into the requested height metric."""
-
-    if not candles:
-        return None, 0.0
-
-    first = candles[0]
-    last = candles[-1]
-
-    try:
-        first_open = float(first[1])
-    except (TypeError, ValueError):
-        first_open = math.nan
-    try:
-        last_close = float(last[4])
-    except (TypeError, ValueError):
-        last_close = math.nan
-
-    total_volume = 0.0
-    for entry in candles:
-        try:
-            vol = float(entry[5])
-        except (TypeError, ValueError):
-            continue
-        if math.isnan(vol):
-            continue
-        total_volume += vol
-
-    if math.isnan(first_open) or math.isnan(last_close):
-        return None, total_volume
-
-    normalized = (metric or "").strip().lower()
-    if normalized == "pricechange":
-        return last_close - first_open, total_volume
-    if normalized == "lastprice":
-        return last_close, total_volume
-
-    if first_open == 0:
-        return None, total_volume
-    return ((last_close - first_open) / first_open) * 100.0, total_volume
-
-
-def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
-    """Extract the quote volume used for secondary ranking."""
-
-    if not isinstance(ticker, dict):
-        return None
-
-    candidates: List[Any] = []
-    for key in ("quoteVolume", "volume", "turnover"):
-        if key in ticker:
-            candidates.append(ticker.get(key))
-    info = ticker.get("info")
-    if isinstance(info, dict):
-        for key in ("quoteVolume", "volume", "turnover"):
-            if key in info:
-                candidates.append(info.get(key))
-
-    for candidate in candidates:
-        try:
-            value = float(candidate)
-        except (TypeError, ValueError):
-            continue
-        if not math.isnan(value):
-            return value
-    return None
-
-
-def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
-    """Translate ``BTC/USDT:USDT`` into the REST identifier ``BTCUSDT``."""
-
-    if not symbol or not isinstance(symbol, str):
-        return None
-    core = symbol.split(":", 1)[0].replace("/", "")
-    if not core.endswith("USDT"):
-        return None
-    return core
-
-
-def _binance_linear_symbol_from_id(symbol: str) -> Optional[str]:
-    """Normalise Binance linear contract identifiers to ccxt symbols."""
-
-    if not symbol or not isinstance(symbol, str):
-        return None
-    token = symbol.strip().upper()
-    if "/" in token or ":" in token:
-        return token
-    if token.endswith("USDT") and len(token) > 4:
-        base = token[:-4]
-        return f"{base}/USDT:USDT"
-    return token or None
-
-
-def _bulk_fetch_recent_ohlcv(
-    exchange: Any,
-    symbols: Sequence[str],
-    timeframe: str,
-    candle_window: int,
-) -> Dict[str, Sequence[Sequence[Any]]]:
-    """Fetch OHLC candles in parallel when possible to speed up filtering."""
-
-    if candle_window <= 0:
-        return {symbol: [] for symbol in symbols}
-    unique_symbols = list(dict.fromkeys(symbols))
-    if not unique_symbols:
-        return {}
-
-    if requests is None:
-        return {
-            symbol: _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
-            for symbol in unique_symbols
-        }
-
-    rest_mapping: Dict[str, Optional[str]] = {
-        symbol: _binance_linear_symbol_id(symbol) for symbol in unique_symbols
-    }
-
-    results: Dict[str, Sequence[Sequence[Any]]] = {}
-    endpoint = "https://fapi.binance.com/fapi/v1/klines"
-    max_workers = min(8, max(1, len(unique_symbols)))
-    timeout = (3.05, 10.0)
-
-    session: Optional[requests.Session]
-    if HTTPAdapter is not None and Retry is not None:
-        retries = Retry(
-            total=2,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET",),
-            raise_on_status=False,
-        )
-        session = requests.Session()
-        adapter = HTTPAdapter(
-            max_retries=retries,
-            pool_connections=max_workers,
-            pool_maxsize=max_workers,
-        )
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-    else:  # pragma: no cover - requests missing adapters
-        session = requests.Session()
-
-    def fetch(symbol: str, rest_symbol: Optional[str]) -> Sequence[Sequence[Any]]:
-        if not rest_symbol:
-            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
-        params = {
-            "symbol": rest_symbol,
-            "interval": timeframe,
-            "limit": candle_window,
-        }
-        try:
-            response = session.get(endpoint, params=params, timeout=timeout)
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as exc:  # pragma: no cover - network variability
-            print(
-                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
-                flush=True,
-            )
-            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
-
-        if not isinstance(payload, list):
-            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
-        return payload[-candle_window:]
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {
-                pool.submit(fetch, symbol, rest_mapping[symbol]): symbol
-                for symbol in unique_symbols
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                symbol = future_map[future]
-                try:
-                    results[symbol] = future.result()
-                except Exception as exc:  # pragma: no cover - defensive
-                    print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
-                    results[symbol] = _fetch_recent_ohlcv(
-                        exchange, symbol, timeframe, candle_window
-                    )
-    finally:
-        session.close()
-
-    return results
-
-
-def _fetch_recent_ohlcv(
-    exchange: Any,
+def evaluate_ict2022(
     symbol: str,
-    timeframe: str,
-    candle_window: int,
-) -> Sequence[Sequence[Any]]:
-    """Fetch the most recent ``candle_window`` OHLC rows for ``symbol``."""
-
-    if candle_window <= 0:
-        return []
-    try:
-        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
-    except Exception as exc:
-        print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
-        return []
-
-
-def _binance_pick_symbols(
-    exchange: Any,
-    limit: int,
-    explicit: Optional[str],
-    selector: BinanceSymbolSelectorConfig,
-) -> BinanceSymbolSelection:
-    """Return Binance USDT-M symbols prioritised by performance metrics."""
-
-    if explicit:
-        requested = [symbol.strip().upper() for symbol in explicit.split(",") if symbol.strip()]
-        try:
-            markets = exchange.load_markets()
-        except Exception as exc:
-            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
-            return BinanceSymbolSelection([], [], False, False)
-        valid: List[str] = []
-        invalid: List[str] = []
-        for symbol in requested:
-            if symbol in markets:
-                valid.append(symbol)
-                continue
-            canonical = _binance_linear_symbol_from_id(symbol)
-            if canonical and canonical in markets:
-                valid.append(canonical)
-            else:
-                invalid.append(symbol)
-        if invalid:
-            invalid_sorted = sorted(dict.fromkeys(invalid))
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
-        return BinanceSymbolSelection(valid, [], False, False)
-
-    try:
-        markets = exchange.load_markets()
-    except Exception as exc:
-        print(f"فشل تحميل أسواق Binance: {exc}")
-        return BinanceSymbolSelection([], [], False, False)
-
-    usdtm_markets: List[Dict[str, Any]] = [
-        market
-        for market in markets.values()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
-    ]
-    if not usdtm_markets:
-        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
-        return BinanceSymbolSelection([], [], False, False)
-
-    try:
-        tickers = exchange.fetch_tickers()
-    except Exception as exc:
-        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
-        tickers = {}
-
-    symbol_set = {
-        market.get("symbol")
-        for market in usdtm_markets
-        if isinstance(market.get("symbol"), str)
+    runtime: SmartMoneyAlgoProE5,
+    snapshot: Dict[str, Any],
+    params: Optional[Dict[str, Any]] = None,
+) -> Optional[ICTMatch]:
+    cfg = {
+        "scan_mode": SCAN_MODE,
+        "entry_mode": ENTRY_MODE,
+        "max_setup_age_bars": MAX_SETUP_AGE_BARS,
+        "disp_atr_k": DISP_ATR_K,
+        "disp_body_ratio": DISP_BODY_RATIO,
+        "fvg_max_age_bars": FVG_MAX_AGE_BARS,
+        "verbose": VERBOSE,
     }
-    tickers = {symbol: tickers.get(symbol, {}) for symbol in symbol_set}
+    if params:
+        cfg.update(params)
 
-    prioritized: List[Tuple[str, float, float]] = []
-    try:
-        threshold = float(selector.top_gainer_threshold) if selector.top_gainer_threshold is not None else None
-    except (TypeError, ValueError):
-        threshold = None
-    metric = (selector.top_gainer_metric or "percentage").strip() or "percentage"
-    scope = (selector.top_gainer_scope or "").strip()
-    try:
-        candle_window = (
-            int(selector.top_gainer_candle_window)
-            if selector.top_gainer_candle_window is not None
-            else None
-        )
-    except (TypeError, ValueError):
-        candle_window = None
-    if candle_window is not None and candle_window <= 0:
-        candle_window = None
+    series = runtime.series
+    last_index = series.length() - 1
+    last_time = series.get_time()
+    events = snapshot.get("event_log", [])
 
-    prioritized_symbols: List[str] = []
-    have_ticker_data = bool(tickers)
-    have_height_requirements = (
-        selector.prioritize_top_gainers
-        and threshold is not None
-        and bool(scope)
-        and candle_window is not None
+    max_age_time = None
+    if last_index >= 0:
+        min_index = max(0, last_index - int(cfg["max_setup_age_bars"]))
+        max_age_time = series.time[min_index]
+
+    sweep = _find_latest_event(
+        events,
+        "liquidity_sweep",
+        min_time=max_age_time,
     )
-    used_height_filter = have_height_requirements
+    if not sweep:
+        return None
 
-    if selector.prioritize_top_gainers and not have_height_requirements:
-        print(
-            "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
-            flush=True,
-        )
+    sweep_time = sweep.get("time")
+    sweep_idx = _bar_index_from_time(series, sweep_time) if sweep_time else None
+    if sweep_idx is None:
+        return None
 
-    if have_height_requirements:
-        timeframe_seconds = _parse_timeframe_to_seconds(scope, None)
-        if timeframe_seconds is None:
-            print(
-                f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
-                flush=True,
-            )
-            have_height_requirements = False
-            used_height_filter = False
-        elif candle_window is None:
-            have_height_requirements = False
-            used_height_filter = False
+    direction = sweep.get("direction")
+    mss = _find_latest_event(
+        events,
+        "mss",
+        direction=direction,
+        min_time=sweep_time,
+    )
+    if not mss:
+        return None
 
-    if have_height_requirements and candle_window:
-        print(
-            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
-            flush=True,
-        )
-        candles_map = _bulk_fetch_recent_ohlcv(
-            exchange,
-            [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
-            scope,
-            candle_window,
-        )
-        for market in usdtm_markets:
-            symbol = market.get("symbol")
-            if not isinstance(symbol, str):
-                continue
-            candles = candles_map.get(symbol) or []
-            metric_value, ohlcv_volume = _ohlcv_metric_value(candles[-candle_window:], metric)
-            if metric_value is None or threshold is None or metric_value < threshold:
-                continue
-            ticker_volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
-            volume = ticker_volume or ohlcv_volume
-            prioritized.append((symbol, metric_value, volume))
-        prioritized.sort(key=lambda item: (item[1], item[2]), reverse=True)
-        prioritized_symbols = [symbol for symbol, _, _ in prioritized]
+    mss_time = mss.get("time")
+    mss_idx = _bar_index_from_time(series, mss_time) if mss_time else None
+    if mss_idx is None or mss_idx < sweep_idx:
+        return None
 
-        if prioritized_symbols:
-            target_limit = limit if limit and limit > 0 else len(prioritized_symbols)
-            limited_prioritized = prioritized_symbols[:target_limit]
-            if len(limited_prioritized) < len(prioritized_symbols):
-                print(
-                    f"تم العثور على {len(prioritized_symbols)} رمزًا تجاوزت حد الارتفاع؛ سيتم مسح أول {len(limited_prioritized)} فقط.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"تم العثور على {len(prioritized_symbols)} رمزًا متوافقة مع حد الارتفاع وسيتم مسحها فقط.",
-                    flush=True,
-                )
-            return BinanceSymbolSelection(
-                limited_prioritized,
-                limited_prioritized,
-                True,
-                True,
-            )
-
-        print(
-            "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
-            flush=True,
-        )
-        return BinanceSymbolSelection([], [], True, True)
-
-    def volume_key(market_data: Dict[str, Any]) -> float:
-        symbol = market_data.get("symbol")
-        if not symbol:
-            return 0.0
-        vol = _extract_quote_volume(tickers.get(symbol, {}))
-        if vol is not None:
-            return vol
-        base_vol = tickers.get(symbol, {}).get("baseVolume")
-        try:
-            return float(base_vol) if base_vol is not None else 0.0
-        except (TypeError, ValueError):
-            return 0.0
-
-    usdtm_by_volume = sorted(usdtm_markets, key=volume_key, reverse=True)
-
-    target_limit = limit if limit and limit > 0 else len(usdtm_by_volume)
-    final: List[str] = []
-    added: set[str] = set()
-
-    for symbol, _, _ in prioritized:
-        if len(final) >= target_limit:
+    disp_event = None
+    for idx in range(mss_idx, last_index + 1):
+        atr = _atr_at_index(series, idx)
+        body = abs(series.close[idx] - series.open[idx])
+        ratio = _body_ratio(series, idx)
+        if (atr and body >= cfg["disp_atr_k"] * atr) or ratio >= cfg["disp_body_ratio"]:
+            disp_event = {
+                "disp_time": series.time[idx],
+                "disp_range": series.high[idx] - series.low[idx],
+                "disp_atr_ratio": body / atr if atr else 0.0,
+                "index": idx,
+            }
             break
-        if symbol not in added:
-            final.append(symbol)
-            added.add(symbol)
+    if not disp_event:
+        return None
 
-    for market in usdtm_by_volume:
-        if len(final) >= target_limit:
-            break
-        symbol = market.get("symbol")
-        if symbol and symbol not in added:
-            final.append(symbol)
-            added.add(symbol)
+    disp_time = disp_event["disp_time"]
+    fvg = _find_latest_event(
+        events,
+        "fvg_created",
+        direction=direction,
+        min_time=disp_time,
+    )
+    if not fvg:
+        return None
 
-    prioritized_symbols = [symbol for symbol, _, _ in prioritized if symbol in added]
-    return BinanceSymbolSelection(final, prioritized_symbols, used_height_filter, have_ticker_data)
+    fvg_time = fvg.get("created_time")
+    fvg_idx = _bar_index_from_time(series, fvg_time) if fvg_time else None
+    if fvg_idx is None or (last_index - fvg_idx) > cfg["fvg_max_age_bars"]:
+        return None
+
+    fvg_low = float(fvg["fvg_low"])
+    fvg_high = float(fvg["fvg_high"])
+    if cfg["scan_mode"].upper() == "ENTRY":
+        current_high = series.get("high")
+        current_low = series.get("low")
+        current_close = series.get("close")
+        midpoint = (fvg_low + fvg_high) / 2.0
+        touched = False
+        if cfg["entry_mode"] == "TOUCH":
+            touched = current_low <= fvg_high and current_high >= fvg_low
+        elif cfg["entry_mode"] == "MIDPOINT":
+            touched = current_low <= midpoint <= current_high
+        elif cfg["entry_mode"] == "FULL_FILL":
+            touched = fvg_low <= current_close <= fvg_high
+        if not touched:
+            return None
+
+    reason = "sweep -> mss -> displacement -> fvg"
+    return ICTMatch(
+        symbol=symbol,
+        direction=direction,
+        mode=cfg["scan_mode"],
+        last_bar_time=last_time,
+        sweep=sweep,
+        mss=mss,
+        displacement=disp_event,
+        fvg=fvg,
+        reason=reason,
+    )
 
 
-def fetch_binance_usdtm_symbols(
+def scan_symbols(
+    symbols: Dict[str, List[Dict[str, float]]],
+    *,
+    params: Optional[Dict[str, Any]] = None,
+) -> List[ICTMatch]:
+    matches: List[ICTMatch] = []
+    for symbol, candles in symbols.items():
+        runtime = SmartMoneyAlgoProE5(base_timeframe="")
+        runtime.process(candles)
+        snapshot = runtime.snapshot_state()
+        match = evaluate_ict2022(symbol, runtime, snapshot, params=params)
+        if match:
+            matches.append(match)
+        elif params and params.get("verbose"):
+            print(f"[{symbol}] no match")
+
+    print(f"FOUND {len(matches)} MATCHES")
+    for match in matches:
+        sweep_time = match.sweep.get("time")
+        mss_time = match.mss.get("time")
+        fvg_low = match.fvg.get("fvg_low")
+        fvg_high = match.fvg.get("fvg_high")
+        print(
+            f"{match.symbol} | {match.direction} | {match.mode} | "
+            f"SWEEP@{sweep_time} | MSS@{mss_time} | FVG[{fvg_low}-{fvg_high}] | "
+            f"LAST_BAR_TIME {match.last_bar_time}"
+        )
+    return matches
+
+
+def _build_ccxt_exchange() -> Optional[Any]:
+    if ccxt is None:
+        print("CCXT غير مثبت. ثبت الحزمة ثم أعد التشغيل.")
+        return None
+    try:
+        exchange = ccxt.binanceusdm(
+            {
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"},
+            }
+        )
+        exchange.load_markets()
+        return exchange
+    except Exception as exc:  # pragma: no cover - network dependency
+        print(f"تعذّر تهيئة Binance USDT-M عبر CCXT: {exc}")
+        return None
+
+
+def _select_binance_usdtm_symbols(
     exchange: Any,
     *,
-    limit: Optional[int] = None,
-    explicit: Optional[str] = None,
-    selector: Optional[BinanceSymbolSelectorConfig] = None,
+    max_symbols: int,
+    selector: BinanceSymbolSelectorConfig = DEFAULT_BINANCE_SYMBOL_SELECTOR,
 ) -> List[str]:
-    """Load Binance USDT-M symbols prioritising momentum if requested."""
-
-    selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
-    selection = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
-    if selection.symbols:
-        return selection.symbols
-    if selection.used_height_filter and selection.had_prioritization_data:
-        return []
-
-    # Fallback to legacy behaviour when prioritisation fails
-    markets = exchange.load_markets()
     symbols = [
         symbol
-        for symbol, market in markets.items()
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+        for symbol, market in exchange.markets.items()
+        if market.get("quote") == "USDT" and market.get("swap") and market.get("active")
     ]
-    symbols.sort()
-    if limit and limit > 0:
-        return symbols[:limit]
-    return symbols
+
+    if selector.prioritize_top_gainers:
+        try:
+            tickers = exchange.fetch_tickers(symbols)
+        except Exception:  # pragma: no cover - network dependency
+            tickers = {}
+        scored = []
+        for symbol in symbols:
+            ticker = tickers.get(symbol) or {}
+            pct = ticker.get("percentage")
+            last = ticker.get("last")
+            change = ticker.get("change")
+            metric = selector.top_gainer_metric
+            if metric == "pricechange" and change is not None:
+                score = change
+            elif metric == "lastprice" and last is not None:
+                score = last
+            else:
+                score = pct if pct is not None else 0.0
+            scored.append((score, symbol))
+        scored.sort(reverse=True)
+        symbols = [symbol for _, symbol in scored]
+
+    return symbols[:max_symbols]
 
 
-def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
-    """Fetch OHLCV data while preserving full history for structural parity.
-
-    Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
-    indicator state across the entire available history, so requesting only the
-    latest ``limit`` bars leads to structural mismatches (missing legacy
-    pullbacks/ChoCh/OB states).  To replicate the indicator faithfully we walk
-    the history from the earliest candle and keep the trailing slice when the
-    caller specifies ``limit``.  Passing ``limit<=0`` fetches the entire
-    available history.
-    """
-
-    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
-    timeframe_ms = timeframe_seconds * 1000
-    max_batch = 1500
-    since = 0
-    candles: List[Dict[str, float]] = []
-    target = limit if limit > 0 else None
-
-    while True:
-        request_limit = max_batch
-        if target is not None and target < max_batch and not candles:
-            # first batch can be trimmed if the caller only needs a small window
-            request_limit = target
-        raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        if not raw:
-            break
-        for entry in raw:
-            candles.append(
-                {
-                    "time": entry[0],
-                    "open": entry[1],
-                    "high": entry[2],
-                    "low": entry[3],
-                    "close": entry[4],
-                    "volume": entry[5],
-                }
-            )
-        if target is not None and len(candles) > target:
-            candles = candles[-target:]
-        last_open = raw[-1][0]
-        next_since = last_open + timeframe_ms
-        if len(raw) < request_limit:
-            break
-        if next_since <= since:
-            next_since = since + timeframe_ms
-        since = next_since
-    return candles
-
-
-def _split_arguments(argument_string: str) -> List[str]:
-    parts: List[str] = []
-    current: List[str] = []
-    depth = 0
-    for char in argument_string:
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        if char == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            current.append(char)
-    if current:
-        parts.append("".join(current).strip())
-    return parts
-
-
-def _extract_pine_input(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*{name}\s*=\s*input\.(\w+)\((.*)\)")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if not match:
-            continue
-        kind = match.group(1)
-        args = match.group(2)
-        pieces = _split_arguments(args)
-        default = pieces[0] if pieces else ""
-        group = "غير محدد"
-        purpose = "غير مذكور"
-        for piece in pieces[1:]:
-            if "group" in piece:
-                group = piece.split("=", 1)[1].strip()
-            literal = re.search(r'(\"[^\"]*\"|\'[^\']*\')', piece)
-            if literal and purpose == "غير مذكور":
-                purpose = literal.group(1)
-        if purpose == "غير مذكور":
-            literal = re.search(r'(\"[^\"]*\"|\'[^\']*\')', pieces[0]) if pieces else None
-            if literal:
-                purpose = literal.group(1)
-        return {
-            "name": name,
-            "type": f"input.{kind}",
-            "group": group,
-            "default": default,
-            "purpose": purpose,
-            "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
+def _fetch_ohlcv(
+    exchange: Any, symbol: str, timeframe: str, limit: int
+) -> List[Dict[str, float]]:
+    candles = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return [
+        {
+            "time": int(time_val),
+            "open": float(open_),
+            "high": float(high),
+            "low": float(low),
+            "close": float(close),
+            "volume": float(volume) if volume is not None else 0.0,
         }
-    return None
-
-
-def _extract_pine_var(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*var\s+(?:\w+\s+)?{name}\s*=\s*(.*)")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if match:
-            return {
-                "name": name,
-                "initial": match.group(1),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def _extract_pine_array(lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"^\s*var\s+{name}\s*=\s*(array\.[^\(]+\(.*\))")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line.strip())
-        if match:
-            return {
-                "name": name,
-                "constructor": match.group(1),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def _capture_pine_function(lines: List[str], start_index: int) -> str:
-    block: List[str] = []
-    block.append(lines[start_index - 1])
-    for line in lines[start_index:]:
-        if line and not line.startswith("    "):
-            break
-        block.append(line)
-    return "\n".join(block).rstrip()
-
-
-def _extract_pine_function(lines: List[str], name: str) -> Optional[Dict[str, Any]]:
-    pattern = re.compile(rf"^\s*{name}\(([^)]*)\)\s*=>")
-    for idx, line in enumerate(lines, 1):
-        match = pattern.match(line)
-        if not match:
-            continue
-        block = _capture_pine_function(lines, idx)
-        return {
-            "name": name,
-            "signature": f"{name}({match.group(1)}) =>",
-            "block": block,
-            "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            "start": idx,
-        }
-    return None
-
-
-def _collect_lines_with(lines: List[str], token: str) -> List[str]:
-    results: List[str] = []
-    for idx, line in enumerate(lines, 1):
-        if token in line:
-            results.append(f"- سطر {idx}: «⟪{line.strip()}⟫»")
-    return results
-
-
-def parse_pine_pullback(pine_text: str) -> PullbackInventory:
-    lines = pine_text.splitlines()
-    inventory = PullbackInventory()
-
-    for idx, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if stripped.startswith("indicator("):
-            inventory.general_info.append(f"- «⟪{stripped}⟫» (سطر {idx})")
-            break
-
-    input_names = [
-        "showHL",
-        "colorHL",
-        "showMn",
-        "showMajoinMiner",
-        "showMajoinMinerMax",
-        "showISOB",
-        "showISOBMax",
-        "ClrMajorOFBull",
-        "ClrMajorOFBear",
-        "ClrMinorOFBull",
-        "ClrMinorOFBear",
+        for time_val, open_, high, low, close, volume in candles
     ]
-    for name in input_names:
-        entry = _extract_pine_input(lines, name)
-        if entry:
-            inventory.inputs.append(entry)
-        else:
-            inventory.missing.append(f"Input {name}")
 
-    var_names = [
-        "puHigh",
-        "puLow",
-        "puHigh_",
-        "puLow_",
-        "puHBar",
-        "puLBar",
-        "lstHlPrs",
-        "lstHlPrsIdm",
-    ]
-    for name in var_names:
-        entry = _extract_pine_var(lines, name)
-        if entry:
-            inventory.vars.append(entry)
-        else:
-            inventory.missing.append(f"Var {name}")
 
-    array_names = [
-        "arrHLLabel",
-        "arrHLCircle",
-        "arrPrevPrs",
-        "arrPrevIdx",
-        "arrPrevPrsMin",
-        "arrPrevIdxMin",
-        "arrlstHigh",
-        "arrlstLow",
-        "arrOBBullm",
-        "arrOBBearm",
-        "arrOBBulls",
-        "arrOBBears",
-        "arrOBBullisVm",
-        "arrOBBearisVm",
-        "arrOBBullisVs",
-        "arrOBBearisVs",
-    ]
-    for name in array_names:
-        entry = _extract_pine_array(lines, name)
-        if entry:
-            inventory.arrays.append(entry)
-        else:
-            inventory.missing.append(f"Array {name}")
-
-    for func_name in ("labelMn", "labelHL"):
-        entry = _extract_pine_function(lines, func_name)
-        if entry:
-            inventory.functions.append(entry)
-        else:
-            inventory.missing.append(f"Function {func_name}")
-
-    # Direction and drawing details
-    for function in inventory.functions:
-        block_lines = function["block"].splitlines()
-        for raw in block_lines:
-            stripped = raw.strip()
-            if any(keyword in stripped for keyword in ("getDirection", "getTextLabel", "getYloc")):
-                inventory.direction_logic.append(f"- {function['name']}: «⟪{stripped}⟫»")
-            if any(keyword in stripped for keyword in ("label.new", "box.new")):
-                draw_type = "label.new" if "label.new" in stripped else "box.new"
-                inventory.outputs.append(
-                    {
-                        "type": draw_type,
-                        "context": function["name"],
-                        "quote": f"«⟪{stripped}⟫»",
-                    }
-                )
-
-    # Definitions
-    inventory.definitions["general"] = [
-        entry["quote"] for entry in inventory.functions
-    ]
-    pine_labelhl = next((f for f in inventory.functions if f["name"] == "labelHL"), None)
-    pine_labelmn = next((f for f in inventory.functions if f["name"] == "labelMn"), None)
-    major_details: List[str] = []
-    minor_details: List[str] = []
-    if pine_labelhl:
-        for line in pine_labelhl["block"].splitlines():
-            stripped = line.strip()
-            if "showMajoinMiner" in stripped or "arrOBBullm" in stripped or "arrHLLabel" in stripped:
-                major_details.append(f"- «⟪{stripped}⟫»")
-    if pine_labelmn:
-        for line in pine_labelmn["block"].splitlines():
-            stripped = line.strip()
-            if "showMn" in stripped or "arrOBBulls" in stripped:
-                minor_details.append(f"- «⟪{stripped}⟫»")
-    inventory.definitions["major"] = major_details
-    inventory.definitions["minor"] = minor_details
-
-    # Timeline from higher level calls
-    timeline_tokens = ["labelMn(", "labelHL("]
-    for token in timeline_tokens:
-        inventory.timeline.extend(_collect_lines_with(lines, token))
-
-    # Dependencies and edge cases
-    if pine_labelhl:
-        inventory.dependencies.append(
-            "- يعتمد على مدخلات Order Flow مثل «⟪showMajoinMiner⟫» و«⟪ClrMajorOFBull⟫» داخل labelHL"
-        )
-        inventory.edge_cases.append(
-            "- إعادة تعيين «⟪arrPrevPrs.set(0,0)⟫» تمنع إعادة استخدام قيم قديمة عند غياب HL/LH"
-        )
-    if pine_labelmn:
-        inventory.dependencies.append(
-            "- الوظيفة labelMn تستخدم «⟪showISOB⟫» لإنشاء صناديق Minor" )
-        inventory.edge_cases.append(
-            "- تصفير «⟪arrPrevPrsMin.set(0,0)⟫» بعد إنشاء الصندوق يمنع تراكم مناطق خاطئة"
-        )
-
-    inventory.tests.extend(
-        [
-            "- حالة صعود: تمرير سلسلة تصنع HH ثم HL يجب أن تفعّل «⟪labelHL(true)⟫» وتضيف صندوق Major Bull.",
-            "- حالة هبوط قصيرة: قمّة/قاع سريعين يجب أن تولّد «⟪labelMn(false)⟫» مع سهم Minor وتحديث arrPrevIdxMin.",
-        ]
-    )
-
-    inventory.coverage = {
-        "Inputs": len(inventory.inputs),
-        "Vars": len(inventory.vars),
-        "Arrays": len(inventory.arrays),
-        "Funcs": len(inventory.functions),
-        "Alerts": 0,
-        "Draws": len(inventory.outputs),
-    }
-
-    return inventory
-
-
-def _extract_python_inputs(python_lines: List[str]) -> List[Dict[str, str]]:
-    inputs: List[Dict[str, str]] = []
-    start_index: Optional[int] = None
-    for idx, line in enumerate(python_lines):
-        if line.strip().startswith("class PullbackInputs"):
-            start_index = idx + 1
-            break
-    if start_index is None:
-        return inputs
-    for idx in range(start_index, len(python_lines)):
-        line = python_lines[idx]
-        if not line.startswith("    ") or line.strip().startswith("@"):
-            break
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if ":" in stripped and "=" in stripped:
-            left, right = stripped.split("=", 1)
-            name_part, type_part = left.split(":", 1)
-            inputs.append(
-                {
-                    "name": name_part.strip(),
-                    "type": type_part.strip(),
-                    "default": right.strip(),
-                    "group": "IndicatorInputs.pullback",
-                    "purpose": "dataclass field",
-                    "quote": f"«⟪{stripped}⟫» (سطر {idx + 1})",
-                }
-            )
-    return inputs
-
-
-def _extract_python_attr(python_lines: List[str], name: str) -> Optional[Dict[str, str]]:
-    pattern = re.compile(rf"self\.{name}\s*=\s*(.*)")
-    for idx, line in enumerate(python_lines, 1):
-        match = pattern.search(line)
-        if match:
-            return {
-                "name": name,
-                "value": match.group(1).strip(),
-                "quote": f"«⟪{line.strip()}⟫» (سطر {idx})",
-            }
-    return None
-
-
-def gather_python_pullback(python_text: str, runtime: SmartMoneyAlgoProE5) -> PullbackInventory:
-    python_lines = python_text.splitlines()
-    inventory = PullbackInventory()
-
-    class_line = _collect_lines_with(python_lines, "class SmartMoneyAlgoProE5:")
-    if class_line:
-        inventory.general_info.extend(class_line)
-
-    input_rows = _extract_python_inputs(python_lines)
-    for row in input_rows:
-        if row["name"] in {"showHL", "colorHL", "showMn"}:
-            inventory.inputs.append(row)
-
-    var_names = [
-        "lstHlPrs",
-        "lstHlPrsIdm",
-        "puHigh",
-        "puLow",
-        "puHBar",
-        "puLBar",
-    ]
-    for name in var_names:
-        entry = _extract_python_attr(python_lines, name)
-        if entry:
-            inventory.vars.append(entry)
-        else:
-            inventory.missing.append(f"Python attr {name}")
-
-    array_names = [
-        "arrHLLabel",
-        "arrHLCircle",
-        "arrPrevPrs",
-        "arrPrevIdx",
-        "arrPrevPrsMin",
-        "arrPrevIdxMin",
-        "arrOBBullm",
-        "arrOBBearm",
-        "arrOBBulls",
-        "arrOBBears",
-        "arrOBBullisVm",
-        "arrOBBearisVm",
-        "arrOBBullisVs",
-        "arrOBBearisVs",
-    ]
-    for name in array_names:
-        entry = _extract_python_attr(python_lines, name)
-        if entry:
-            inventory.arrays.append(entry)
-
-    python_functions: List[Dict[str, Any]] = []
-    for func_name in ("labelMn", "labelHL"):
-        func = getattr(SmartMoneyAlgoProE5, func_name)
-        source_lines, start_line = inspect.getsourcelines(func)
-        block = "".join(source_lines).rstrip()
-        python_functions.append(
-            {
-                "name": func_name,
-                "signature": source_lines[0].strip(),
-                "block": block,
-                "quote": f"«⟪{source_lines[0].strip()}⟫» (سطر {start_line})",
-                "start": start_line,
-            }
-        )
-    inventory.functions.extend(python_functions)
-
-    for function in python_functions:
-        for raw in function["block"].splitlines():
-            stripped = raw.strip()
-            if any(keyword in stripped for keyword in ("self.getDirection", "self.getTextLabel", "self.getYloc")):
-                inventory.direction_logic.append(f"- {function['name']}: «⟪{stripped}⟫»")
-            if any(keyword in stripped for keyword in ("self.label_new", "self.box_new")):
-                draw_type = "self.label_new" if "self.label_new" in stripped else "self.box_new"
-                inventory.outputs.append(
-                    {
-                        "type": draw_type,
-                        "context": function["name"],
-                        "quote": f"«⟪{stripped}⟫»",
-                    }
-                )
-            if "self.arrPrevPrs.set(0, 0)" in stripped or "self.arrPrevPrsMin.set(0, 0)" in stripped:
-                inventory.edge_cases.append(f"- {function['name']}: «⟪{stripped}⟫»")
-
-    inventory.definitions["general"] = [entry["quote"] for entry in python_functions]
-    py_labelhl = next((f for f in python_functions if f["name"] == "labelHL"), None)
-    py_labelmn = next((f for f in python_functions if f["name"] == "labelMn"), None)
-    if py_labelhl:
-        inventory.definitions["major"] = [
-            f"- «⟪{line.strip()}⟫" for line in py_labelhl["block"].splitlines() if "showMajoinMiner" in line or "arrOBBullm" in line
-        ]
-    if py_labelmn:
-        inventory.definitions["minor"] = [
-            f"- «⟪{line.strip()}⟫" for line in py_labelmn["block"].splitlines() if "showMn" in line or "arrOBBulls" in line
-        ]
-
-    timeline_tokens = ["self.labelMn(", "self.labelHL("]
-    for token in timeline_tokens:
-        inventory.timeline.extend(_collect_lines_with(python_lines, token))
-
-    if py_labelhl:
-        inventory.dependencies.append(
-            "- labelHL يستخدم «⟪self.inputs.order_flow.showMajoinMiner⟫» و«⟪self.inputs.order_flow.ClrMajorOFBull⟫» لتوليد مناطق Major"
-        )
-    if py_labelmn:
-        inventory.dependencies.append(
-            "- labelMn يعتمد على «⟪self.inputs.order_flow.showISOB⟫» لبناء صناديق Minor"
-        )
-
-    inventory.tests.extend(
-        [
-            "- استدعاء runtime.labelHL(True) بعد تهيئة بيانات تصاعدية يجب أن يضيف نص HH بنفس ترتيب Pine.",
-            "- معالجة شمعة انعكاس سريعة ثم runtime.labelMn(False) يجب أن يدفع صندوق Minor Bear مطابق للسكربت." ,
-        ]
-    )
-
-    inventory.coverage = {
-        "Inputs": len(inventory.inputs),
-        "Vars": len(inventory.vars),
-        "Arrays": len(inventory.arrays),
-        "Funcs": len(inventory.functions),
-        "Alerts": 0,
-        "Draws": len(inventory.outputs),
-    }
-
-    return inventory
-
-
-def format_pullback_section(source: str, inventory: PullbackInventory) -> str:
-    lines: List[str] = []
-    lines.append(f"## {source}")
-    lines.append("B) قالب الإخراج النهائي — Pullback")
-    lines.append("0. بيانات عامة مقتصرة على صلة Pullback")
-    lines.extend(inventory.general_info or ["- غير موجود"])
-
-    lines.append("1. جدول Inputs المؤثرة في Pullback — تطابق 1:1")
-    if inventory.inputs:
-        lines.append("| الاسم | النوع | المجموعة/العرض | القيمة الافتراضية | الغرض | المصدر |")
-        lines.append("|------|-------|-----------------|-------------------|--------|---------|")
-        for item in inventory.inputs:
-            lines.append(
-                f"| {item['name']} | {item['type']} | {item.get('group', '')} | {item.get('default', '')} | {item.get('purpose', '')} | {item['quote']} |"
-            )
-    else:
-        lines.append("- لا توجد مدخلات")
-
-    lines.append("2. Constants — تطابق 1:1")
-    lines.append("- غير موجود")
-
-    lines.append("3. Vars و Arrays الخاصة بالPullback — الاسم/التهيئة/متى تتغيّر/الدور")
-    if inventory.vars or inventory.arrays:
-        for item in inventory.vars:
-            lines.append(f"- متغير {item['name']}: {item['quote']}")
-        for item in inventory.arrays:
-            lines.append(f"- مصفوفة {item['name']}: {item['quote']}")
-    else:
-        lines.append("- لا توجد متغيرات/مصفوفات")
-
-    lines.append("4. الدوال (Functions) — التوقيع + منطق داخلي خطوة-بخطوة")
-    if inventory.functions:
-        for function in inventory.functions:
-            lines.append(f"- {function['signature']} — {function['quote']}")
-    else:
-        lines.append("- لا توجد دوال")
-
-    lines.append("5. تعريفات التشغيل:")
-    lines.append("5.1) تعريف Pullback العام")
-    lines.extend(inventory.definitions.get("general", ["- غير موجود"]))
-    lines.append("5.2) Major Pullback — الشروط/العتبات/الفلاتر/الفروقات")
-    lines.extend(inventory.definitions.get("major", ["- غير موجود"]))
-    lines.append("5.3) Minor Pullback — الشروط/العتبات/الفلاتر/الفروقات")
-    lines.extend(inventory.definitions.get("minor", ["- غير موجود"]))
-
-    lines.append("6. منطق الاتجاه/الهيكل المُستخدم كأساس (HH/HL/LH/LL/ChoCh/BOS…) وتأثيره")
-    lines.extend(inventory.direction_logic or ["- غير موثق"])
-
-    lines.append("7. التسلسل الزمني (Top→Down) مع «⟪…⟫»")
-    lines.extend(inventory.timeline or ["- غير متاح"])
-
-    lines.append("8. المخرجات البصرية/التنبيهات المتعلقة بـPullback")
-    if inventory.outputs:
-        for output in inventory.outputs:
-            lines.append(f"- {output['context']}::{output['type']} {output['quote']}")
-    else:
-        lines.append("- لا توجد مخرجات")
-
-    lines.append("9. Dependences Graph (نصي مختصر)")
-    lines.extend(inventory.dependencies or ["- غير محدد"])
-
-    lines.append("10. الحالات الحدّية/القيود")
-    lines.extend(inventory.edge_cases or ["- غير مصرح"])
-
-    lines.append("11. اختبارات تحقق سريعة")
-    lines.extend(inventory.tests or ["- غير متوفر"])
-
-    lines.append("12. قائمة التحقق (Coverage 99.99%)")
-    coverage_parts = [f"{key}: {value}" for key, value in inventory.coverage.items()]
-    lines.append("- " + " | ".join(coverage_parts))
-    if inventory.missing:
-        for missing in inventory.missing:
-            lines.append(f"- عنصر غير مواءم: {missing}")
-    else:
-        lines.append("- لا توجد عناصر ناقصة")
-
-    return "\n".join(lines)
-
-
-def build_pullback_comparison(pine: PullbackInventory, python: PullbackInventory) -> str:
-    lines: List[str] = []
-    lines.append("A) قالب عام للمقارنة (Pine ↔ Python)")
-    lines.append("1. نطاق التحليل: Pullback")
-    lines.append("2. ملخص التطابق العام 1:1: قيد التحقق اليدوي (تم تجهيز الجرد الكامل)")
-    lines.append("3. مصفوفة المواءمة 1:1:")
-    lines.append("الاسم (Pine) | الاسم (Python) | النوع | المعادلة/الشرط | نقاط التحديث | استدعاءات الرسم/التنبيه | الملاحظة")
-
-    def _line_from(block: Optional[Dict[str, Any]], token: str) -> str:
-        if not block:
-            return "غير متاح"
-        for raw in block["block"].splitlines():
-            stripped = raw.strip()
-            if token in stripped:
-                return f"«⟪{stripped}⟫»"
-        return "غير متاح"
-
-    pine_labelhl = next((f for f in pine.functions if f["name"] == "labelHL"), None)
-    pine_labelmn = next((f for f in pine.functions if f["name"] == "labelMn"), None)
-    python_labelhl = next((f for f in python.functions if f["name"] == "labelHL"), None)
-    python_labelmn = next((f for f in python.functions if f["name"] == "labelMn"), None)
-
-    lines.append(
-        "labelHL | labelHL | دالة | "
-        + _line_from(pine_labelhl, "showHL")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.inputs.pullback.showHL")
-        + " | "
-        + _line_from(pine_labelhl, "arrOBBullm.unshift")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.arrOBBullm.unshift")
-        + " | "
-        + _line_from(pine_labelhl, "label.new")
-        + " ↔ "
-        + _line_from(python_labelhl, "self.label_new")
-        + " | مطابق مشروط بالمدخلات"
-    )
-    lines.append(
-        "labelMn | labelMn | دالة | "
-        + _line_from(pine_labelmn, "showMn")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.inputs.pullback.showMn")
-        + " | "
-        + _line_from(pine_labelmn, "arrOBBulls.unshift")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.arrOBBulls.unshift")
-        + " | "
-        + _line_from(pine_labelmn, "label.new")
-        + " ↔ "
-        + _line_from(python_labelmn, "self.label_new")
-        + " | مطابق مع مراقبة شروط Minor"
-    )
-
-    lines.append("4. الفروقات الموثقة:")
-    lines.append("- لا توجد فروقات موثقة ضمن النطاق بعد؛ يلزم تشغيل الحالات الاختبارية للتأكيد")
-
-    lines.append("5. حالات اختبار نصّية:")
-    lines.extend(pine.tests)
-
-    lines.append("6. تقرير التغطية:")
-    pine_cov = " | ".join(f"Pine {k}: {v}" for k, v in pine.coverage.items())
-    python_cov = " | ".join(f"Python {k}: {v}" for k, v in python.coverage.items())
-    lines.append(f"- {pine_cov}")
-    lines.append(f"- {python_cov}")
-    if pine.missing or python.missing:
-        for missing in pine.missing:
-            lines.append(f"- Pine ناقص: {missing}")
-        for missing in python.missing:
-            lines.append(f"- Python ناقص: {missing}")
-    else:
-        lines.append("- لا توجد عناصر غير مواءمة معلنة")
-
-    return "\n".join(lines)
-
-
-def generate_pullback_report(
-    pine_text: str, python_text: str, runtime: SmartMoneyAlgoProE5
-) -> str:
-    pine_inventory = parse_pine_pullback(pine_text)
-    python_inventory = gather_python_pullback(python_text, runtime)
-    sections = [
-        build_pullback_comparison(pine_inventory, python_inventory),
-        format_pullback_section("Pine Script v5", pine_inventory),
-        format_pullback_section("Python Runtime", python_inventory),
-    ]
-    return "\n\n".join(sections)
-
-
-def render_report(
-    runtime: SmartMoneyAlgoProE5,
-    outfile: Path,
-    scanner_rows: Optional[List[Dict[str, Any]]] = None,
-) -> None:
-    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-    pullback_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - showHL: {runtime.inputs.pullback.showHL}
-        - showMn: {runtime.inputs.pullback.showMn}
-
-        ### الأحداث المكتشفة
-        - عدد ملصقات Pullback: {sum(1 for lbl in runtime.labels if lbl.text in ("HH", "HL", "LH", "LL"))}
-        """
-    ).strip()
-
-    market_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - showSMC: {runtime.inputs.structure.showSMC}
-        - lengSMC: {runtime.inputs.structure.lengSMC}
-        - structure_type: {runtime.inputs.structure.structure_type}
-
-        ### الكيانات
-        - خطوط الهيكل: {sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted"))}
-        - تنبيهات الهيكل: {sum(1 for _, title in runtime.alerts if "BOS" in title or "ChoCh" in title)}
-        """
-    ).strip()
-
-    order_block_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - extndBox: {runtime.inputs.order_block.extndBox}
-        - showExob: {runtime.inputs.order_block.showExob}
-        - showIdmob: {runtime.inputs.order_block.showIdmob}
-        - showSCOB: {runtime.inputs.order_block.showSCOB}
-
-        ### المناطق الفعالة
-        - إجمالي الصناديق: {len(runtime.boxes)}
-        - تنبيهات IDM EXT: {sum(1 for _, title in runtime.alerts if "IDM EXT" in title)}
-        """
-    ).strip()
-
-    scob_section = textwrap.dedent(
-        f"""
-        ### الإعدادات
-        - Show SCOB: {runtime.inputs.order_block.showSCOB}
-        - Bullish SCOB اللون: {runtime.inputs.order_block.scobUp}
-        - Bearish SCOB اللون: {runtime.inputs.order_block.scobDn}
-
-        ### إشارات الشموع
-        - ألوان الأعمدة المسجلة: {len(runtime.bar_colors)}
-        - تنبيهات Order Flow: {sum(1 for _, title in runtime.alerts if "order flow" in title.lower())}
-        """
-    ).strip()
-
-    comparison = getattr(runtime.tracer, "comparison", None)
-    trace_section = ""
-    if comparison:
-        lines = [
-            f"- حالة المطابقة: {'مطابق' if comparison.matches else 'اختلاف'}",
-            f"- أحداث المرجع: {comparison.reference_events}",
-            f"- الأحداث الحالية: {comparison.current_events}",
-        ]
-        if comparison.mismatches:
-            preview = comparison.mismatches[:5]
-            for mismatch in preview:
-                ref_dump = json.dumps(mismatch.get("reference", {}), ensure_ascii=False)
-                cur_dump = json.dumps(mismatch.get("current", {}), ensure_ascii=False)
-                lines.append(
-                    f"- الحدث #{mismatch.get('index')}: المرجع={ref_dump} | الحالي={cur_dump}"
-                )
-            if len(comparison.mismatches) > len(preview):
-                remaining = len(comparison.mismatches) - len(preview)
-                lines.append(f"- ... {remaining} اختلافات إضافية")
-        trace_section = "## مقارنة التتبع\n" + "\n".join(lines)
-
-    coverage_table = textwrap.dedent(
-        """
-        | الحزمة | المدخلات | المتغيرات | المصفوفات | الدوال | التنبيهات | العناصر المرسومة |
-        |--------|----------|-----------|-----------|--------|-----------|--------------------|
-        | Pullback | 3 | 6 | 4 | 3 | 0 | {pullback_draws} |
-        | Market Structure | 6 | 18 | 12 | 10 | {ms_alerts} | {ms_draws} |
-        | Order Block | 18 | 22 | 16 | 12 | {ob_alerts} | {len_boxes} |
-        | SCOB | 3 | 5 | 4 | 4 | {scob_alerts} | {bar_colors} |
-        """
-    ).format(
-        pullback_draws=sum(1 for lbl in runtime.labels if lbl.text in ("HH", "HL", "LH", "LL")),
-        ms_alerts=sum(1 for _, title in runtime.alerts if "BOS" in title or "ChoCh" in title),
-        ms_draws=sum(1 for line in runtime.lines if line.style in ("line.style_dashed", "line.style_dotted")),
-        ob_alerts=sum(
-            1 for _, title in runtime.alerts if "IDM EXT" in title or "OB Break" in title
-        ),
-        len_boxes=len(runtime.boxes),
-        scob_alerts=sum(1 for _, title in runtime.alerts if "order flow" in title.lower()),
-        bar_colors=len(runtime.bar_colors),
-    )
-
-    trace_block = f"{trace_section}\n\n" if trace_section else ""
-
-    full_settings_lines: List[str] = [f"- عدد الشموع المحللة: {runtime.series.length()}"]
-
-    def collect_inputs(prefix: str, value: Any) -> None:
-        if dataclasses.is_dataclass(value):
-            collect_inputs(prefix, dataclasses.asdict(value))
-            return
-        if isinstance(value, dict):
-            for key in sorted(value.keys()):
-                child_prefix = f"{prefix}.{key}" if prefix else key
-                collect_inputs(child_prefix, value[key])
-            return
-        if isinstance(value, list):
-            for idx, item in enumerate(value):
-                collect_inputs(f"{prefix}[{idx}]", item)
-            return
-        full_settings_lines.append(f"- {prefix}: {_serialize_scalar(value)}")
-
-    inputs_dict = dataclasses.asdict(runtime.inputs)
-    for key in sorted(inputs_dict.keys()):
-        collect_inputs(key, inputs_dict[key])
-
-    full_settings_section = "## الإعدادات الكاملة\n" + "\n".join(full_settings_lines)
-
-    scanner_section = ""
-    if scanner_rows:
-        rows = "\n".join(
-            f"| {row['symbol']} | {row['timeframe']} | {row.get('candles', '')} | "
-            f"{row.get('alerts', 0)} | {row.get('boxes', 0)} | "
-            f"{row.get('metrics', {}).get('demand_zones', 0)} | {row.get('metrics', {}).get('supply_zones', 0)} | "
-            f"{row.get('metrics', {}).get('bullish_fvg', 0)} | {row.get('metrics', {}).get('bearish_fvg', 0)} | "
-            f"{row.get('metrics', {}).get('order_flow_boxes', 0)} | {row.get('metrics', {}).get('scob_colored_bars', 0)} |"
-            for row in scanner_rows
-        )
-        scanner_section = textwrap.dedent(
-            f"""
-## ماسح Binance USDT-M
-
-| الرمز | الإطار الزمني | الشموع | التنبيهات | الصناديق | مناطق الطلب | مناطق العرض | FVG صاعدة | FVG هابطة | Order Flow | SCOB |
-|-------|---------------|--------|-----------|-----------|-------------|--------------|-----------|-----------|------------|------|
-{rows}
-
-"""
-        )
-
-    content = textwrap.dedent(
-        f"""
-# FINAL_REPORT_SMART_MONEY_ANALYSIS
-
-**المؤشر**: Smart Money Algo Pro E5 - CHADBULL
-**التاريخ**: {now}
-
-{scanner_section}## فهرس المحتويات
-1. [Pullback](#pullback)
-2. [Market Structure](#market-structure)
-3. [Order Block](#order-block)
-4. [SCOB / Zone Type](#scob--zone-type)
-5. [قائمة التحقق (Coverage 99.99%)](#قائمة-التحقق-coverage-9999)
-6. [الإعدادات الكاملة](#الإعدادات-الكاملة)
-
-## Pullback
-{pullback_section}
-
-## Market Structure
-{market_section}
-
-## Order Block
-{order_block_section}
-
-## SCOB / Zone Type
-{scob_section}
-
-{trace_block}## قائمة التحقق (Coverage 99.99%)
-{coverage_table}
-
-{full_settings_section}
-        """
-    ).strip()
-    outfile.write_text(content + "\n")
-
-
-def run_runtime_from_file(
-    source: Path,
-    outfile: Path,
-    timeframe: str = "",
-    bars: int = 0,
-    inputs: Optional[IndicatorInputs] = None,
-) -> None:
-    candles = json.loads(source.read_text())
-    if bars > 0:
-        candles = candles[-bars:]
-    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
-    runtime.process(candles)
-    triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
-    if triggers:
-        for _ln in triggers:
-            print("  →", _ln)
-        if cfg.tg_enable:
-            try:
-                _send_tg(cfg, [f"{sym} {args.timeframe}"] + triggers)
-            except Exception:
-                pass
-    render_report(runtime, outfile)
-
-
-METRIC_LABELS = [
-    ("alerts", "عدد التنبيهات"),
-    ("pullback_arrows", "إشارات Pullback"),
-    ("choch_labels", "علامات CHoCH"),
-    ("bos_labels", "علامات BOS"),
-    ("idm_labels", "علامات IDM"),
-    ("demand_zones", "مناطق الطلب"),
-    ("supply_zones", "مناطق العرض"),
-    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
-    ("idm_ob_touched", "IDM OB تم ملامستها"),
-    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
-    ("ext_ob_touched", "EXT OB تم ملامستها"),
-    ("bullish_fvg", "فجوات FVG صاعدة"),
-    ("bearish_fvg", "فجوات FVG هابطة"),
-    ("order_flow_boxes", "صناديق Order Flow"),
-    ("liquidity_objects", "مستويات السيولة"),
-    ("scob_colored_bars", "شموع SCOB"),
-]
-
-
-EVENT_DISPLAY_ORDER = [
-    ("BOS", "BOS"),
-    ("BOS_PLUS", "BOS+"),
-    ("CHOCH", "CHOCH"),
-    ("MSS_PLUS", "MSS+"),
-    ("MSS", "MSS"),
-    ("IDM", "IDM"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
-    ("GOLDEN_ZONE", "Golden zone"),
-    ("X", "X"),
-    ("RED_CIRCLE", "الدوائر الحمراء"),
-    ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
-]
-
-
-def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
-    header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
-    symbol_display = _format_symbol(symbol)
-    header_lines = [
-        f"{header_color}{ANSI_BOLD}════ تحليل {symbol_display}{header_color}{ANSI_BOLD} ({timeframe}) ════{ANSI_RESET}",
-        f"{ANSI_DIM}عدد الشموع: {candle_count}{ANSI_RESET}",
-    ]
-    price_value = metrics.get("current_price")
-    if isinstance(price_value, (int, float)):
-        price_value = float(price_value)
-        if not math.isnan(price_value):
-            header_lines.append(f"{ANSI_DIM}السعر الحالي: {format_price(price_value)}{ANSI_RESET}")
-    elif isinstance(price_value, str):
-        header_lines.append(f"{ANSI_DIM}السعر الحالي: {price_value}{ANSI_RESET}")
-    change_value = metrics.get("daily_change_percent")
-    if isinstance(change_value, (int, float)):
-        header_lines.append(
-            f"{ANSI_DIM}تغير 24 ساعة: {change_value:+.2f}%{ANSI_RESET}"
-        )
-    header = "\n".join(header_lines)
-    print(header, flush=True)
-    for key, label in METRIC_LABELS:
-        value = metrics.get(key, 0)
-        value_color = ANSI_VALUE_POS if value > 0 else ANSI_VALUE_ZERO
-        print(
-            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{value}{ANSI_RESET}",
-            flush=True,
-        )
-    latest_events = metrics.get("latest_events") or {}
-    print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=True)
-    for key, label in EVENT_DISPLAY_ORDER:
-        event = latest_events.get(key)
-        if event:
-            display_text = event.get("display")
-            if display_text is None:
-                price = event.get("price")
-                if isinstance(price, tuple):
-                    display_text = " → ".join(format_price(p) for p in price)
-                else:
-                    display_text = format_price(price if isinstance(price, (int, float)) else None)
-            status_display = event.get("status_display")
-            if status_display:
-                display_text = f"{display_text} [{status_display}]"
-            time_display = event.get("time_display") or format_timestamp(event.get("time"))
-            if time_display and time_display != "—":
-                display_text = f"{display_text} | {time_display}"
-            direction_hint = _resolve_direction(
-                event.get("direction"),
-                event.get("direction_display"),
-                event.get("status"),
-                event.get("text"),
-                display_text,
-            )
-            colored_display = _colorize_directional_text(
-                display_text,
-                direction=direction_hint,
-                fallback=ANSI_VALUE_POS,
-            )
-        else:
-            colored_display = _colorize_directional_text("—", direction=None, fallback=ANSI_VALUE_ZERO)
-        print(
-            f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {colored_display}",
-            flush=True,
-        )
-    print(f"{ANSI_DIM}{'-'*48}{ANSI_RESET}", flush=True)
-
-
-def print_trace_comparison(result: TraceComparisonResult) -> None:
-    status = "مطابق" if result.matches else "اختلاف"
-    print(f"Trace comparison: {status} (المرجع={result.reference_events}, الحالي={result.current_events})", flush=True)
-    if result.mismatches:
-        preview = result.mismatches[:5]
-        for mismatch in preview:
-            print(
-                "  - الحدث #{idx}: المرجع={ref} | الحالي={cur}".format(
-                    idx=mismatch.get("index"),
-                    ref=json.dumps(mismatch.get("reference", {}), ensure_ascii=False),
-                    cur=json.dumps(mismatch.get("current", {}), ensure_ascii=False),
-                ),
-                flush=True,
-            )
-        extra = len(result.mismatches) - len(preview)
-        if extra > 0:
-            print(f"  - ... {extra} اختلافات إضافية", flush=True)
-
-
-def _extract_daily_change_percent(ticker: Dict[str, Any]) -> Optional[float]:
-    """Return the 24h percentage change if available."""
-
-    value = ticker.get("percentage") if isinstance(ticker, dict) else None
-    if value is None:
-        open_price = ticker.get("open") if isinstance(ticker, dict) else None
-        last_price = ticker.get("last") if isinstance(ticker, dict) else None
-        if open_price and last_price and open_price != 0:
-            value = ((float(last_price) - float(open_price)) / float(open_price)) * 100.0
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _collect_recent_event_hits(
-    series: Any,
-    latest_events: Any,
+def scan_binance_usdtm(
     *,
-    bars: int = 2,
-) -> Tuple[List[str], List[int]]:
-    """Identify latest-event keys that fall within the most recent candles."""
-
-    if bars <= 0:
-        return [], []
-
-    recent_times: List[int] = []
-    if hasattr(series, "get_time"):
-        for offset in range(bars):
-            try:
-                ts = series.get_time(offset)
-            except Exception:
-                ts = None
-            if isinstance(ts, (int, float)) and ts > 0:
-                recent_times.append(int(ts))
-
-    if not recent_times or not isinstance(latest_events, dict):
-        return [], recent_times
-
-    hits: List[str] = []
-    for key, payload in latest_events.items():
-        timestamp: Optional[Union[int, float]] = None
-        if isinstance(payload, dict):
-            timestamp = payload.get("time") or payload.get("ts") or payload.get("timestamp")
-        if isinstance(timestamp, (int, float)) and int(timestamp) in recent_times:
-            hits.append(str(key))
-    return hits, recent_times
-
-
-def scan_binance(
     timeframe: str,
     limit: int,
-    symbols: Optional[List[str]],
-    concurrency: int,
-    tracer: Optional[ExecutionTracer] = None,
-    *,
-    min_daily_change: float = 0.0,
-    inputs: Optional[IndicatorInputs] = None,
-    recent_window_bars: Optional[int] = None,
-    max_symbols: Optional[int] = None,
-    symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
-) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
-    if ccxt is None:
-        raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    all_symbols = symbols or fetch_binance_usdtm_symbols(
-        exchange,
-        limit=max_symbols,
-        selector=symbol_selector,
-    )
-    if max_symbols and max_symbols > 0:
-        all_symbols = all_symbols[: int(max_symbols)]
-    summaries: List[Dict[str, Any]] = []
-    primary_runtime: Optional[SmartMoneyAlgoProE5] = None
-    window = recent_window_bars
-    if window is None:
-        console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
-        else:
-            window = 2
-    window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
-                    symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
-                )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(
-            inputs=inputs,
-            base_timeframe=timeframe,
-            tracer=tracer,
-            recent_bars=window,
-        )
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
-
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
-        if primary_runtime is None:
-            primary_runtime = runtime
-    if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(
-            inputs=inputs,
-            tracer=tracer,
-            recent_bars=window,
-        )
-        primary_runtime.process([])
-    return primary_runtime, summaries
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
-    parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
-    parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
-    parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe used when scanning Binance")
-    parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data or --no-scan")
-    parser.add_argument(
-        "--lookback",
-        type=int,
-        default=0,
-        help="Number of candles to request per symbol when scanning (0 = full history)",
-    )
-    parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
-    parser.add_argument("--symbols", type=str, default="")
-    parser.add_argument("--concurrency", type=int, default=3)
-    parser.add_argument(
-        "--min-daily-change",
-        type=float,
-        default=0.0,
-        help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
-    )
-    parser.add_argument(
-        "--pullback-report",
-        action="store_true",
-        help="توليد تقرير جرد Pullback (Pine ↔ Python) وفق قالب OS-PB/1",
-    )
-    parser.add_argument(
-        "--pine-source",
-        type=Path,
-        default=Path("Smart Money Algo Pro E5 - CHADBULL.txt"),
-        help="مسار ملف Pine الأصلي لاستخراج منطق Pullback",
-    )
-    parser.add_argument("--no-scan", action="store_true")
-    parser.add_argument("--trace", action="store_true", help="Enable execution tracing")
-    parser.add_argument("--trace-file", type=Path, help="Write execution trace to JSON file")
-    parser.add_argument("--compare-trace", type=Path, help="قارن التتبع الحالي بملف JSON مرجعي")
-    parser.add_argument(
-        "--max-age-bars",
-        type=int,
-        default=1,
-        help="Ignore console events older than this many completed bars (minimum 1)",
-    )
-    parser.add_argument(
-        "--continuous",
-        "--continuous-scan",
-        dest="continuous_scan",
-        action=_OptionalBoolAction,
-        default=False,
-        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
-    )
-    parser.add_argument(
-        "--no-continuous",
-        "--no-continuous-scan",
-        dest="continuous_scan",
-        action="store_false",
-        help="تعطيل حلقة المسح المستمرة",
-    )
-    parser.add_argument(
-        "--scan-interval",
-        type=float,
-        default=0.0,
-        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
-    )
-    args = parser.parse_args(argv)
-    if args.min_daily_change < 0.0:
-        parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars <= 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
-    if args.scan_interval < 0.0:
-        parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
-
-    def log(stage: str) -> None:
-        print(stage, flush=True)
-
-    tracer = ExecutionTracer(enabled=args.trace, outfile=args.trace_file)
-
-    def perform_comparison() -> None:
-        if args.compare_trace:
-            result = tracer.compare(args.compare_trace)
-            print_trace_comparison(result)
-
-    indicator_inputs = IndicatorInputs()
-    indicator_inputs.console.max_age_bars = args.max_age_bars
-
-    if args.pullback_report:
-        log("Foundation")
-        pine_text = args.pine_source.read_text(encoding="utf-8")
-        python_text = Path(__file__).read_text(encoding="utf-8")
-        log("Inventory")
-        runtime = SmartMoneyAlgoProE5(
-            inputs=indicator_inputs,
-            base_timeframe=args.analysis_timeframe or None,
-            tracer=tracer,
-        )
-        log("Timeline")
-        runtime.process([])
-        log("Rendering")
-        report_text = generate_pullback_report(pine_text, python_text, runtime)
-        args.outfile.write_text(report_text, encoding="utf-8")
-        print(f"Pullback report written to {args.outfile}")
-        log("Coverage")
-        tracer.emit()
-        return 0
-
-    if args.data:
-        log("Foundation")
-        candles = json.loads(args.data.read_text())
-        if args.bars > 0:
-            candles = candles[-args.bars :]
-        log("Inventory")
-        runtime = SmartMoneyAlgoProE5(
-            inputs=indicator_inputs,
-            base_timeframe=args.analysis_timeframe or None,
-            tracer=tracer,
-        )
-        log("Timeline")
-        runtime.process(candles)
-        perform_comparison()
-        log("Rendering")
-        render_report(runtime, args.outfile)
-        log("Coverage")
-        tracer.emit()
-        return 0
-
-    if args.no_scan:
-        log("Foundation")
-        log("Inventory")
-        runtime = SmartMoneyAlgoProE5(
-            inputs=indicator_inputs,
-            base_timeframe=args.analysis_timeframe or None,
-            tracer=tracer,
-        )
-        log("Timeline")
-        runtime.process([])
-        perform_comparison()
-        log("Rendering")
-        render_report(runtime, args.outfile)
-        log("Coverage")
-        tracer.emit()
-        return 0
-
-    manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
-
-    iteration = 0
-    try:
-        while True:
-            iteration += 1
-            tracer.clear()
-            start = time.time()
-            if args.continuous_scan and iteration > 1:
-                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-            log("Foundation")
-            log("Inventory")
-            log("Timeline")
-            runtime, summaries = scan_binance(
-                args.timeframe,
-                args.lookback,
-                manual_symbols,
-                args.concurrency,
-                tracer,
-                min_daily_change=args.min_daily_change,
-                inputs=indicator_inputs,
-            )
-            perform_comparison()
-            log("Rendering")
-            render_report(runtime, args.outfile, summaries)
-            elapsed = time.time() - start
-            log(f"Coverage ({elapsed:.2f}s)")
-            tracer.emit()
-            if not args.continuous_scan:
-                print(
-                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
-                    " لتفعيل الحلقة استخدم --continuous-scan=true أو فعّل المتغير"
-                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
-                    flush=True,
-                )
-                break
-            if args.scan_interval > 0.0:
-                print(
-                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
-                    flush=True,
-                )
-                time.sleep(args.scan_interval)
-    except KeyboardInterrupt:
-        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
-    return 0
-
-
-# ============================================================================
-# Embedded Binance symbol picker + live scanner CLI (non-invasive)
-# - لا تغييرات على منطق المؤشر؛ كل شيء هنا مستقل ويستدعي الواجهات العامة فقط
-# ============================================================================
-
-# ----------------------------- Filters & Helpers -----------------------------
-_MEME_BASES = {
-    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BABYDOGE","MOG","DEGEN","PONKE","BODEN","MEME",
-    "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
-}
-_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-def _pct_24h(t: Dict) -> float:
-    v = t.get("percentage")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("priceChangePercent")
-    try:
-        return float(v)
-    except Exception:
-        return 0.0
-
-def _qv_24h(t: Dict) -> float:
-    v = t.get("quoteVolume")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("quoteVolume")
-    try:
-        return float(v) if v is not None else 0.0
-    except Exception:
-        return 0.0
-
-def _base(sym: str) -> str:
-    if "/" in sym:
-        return sym.split("/")[0]
-    if sym.endswith("USDT"):
-        return sym[:-4]
-    return sym
-
-def _normalize_list(csv_like: str) -> List[str]:
-    if not csv_like:
+    max_symbols: int,
+    recent_bars: int = 0,
+    params: Optional[Dict[str, Any]] = None,
+    selector: BinanceSymbolSelectorConfig = DEFAULT_BINANCE_SYMBOL_SELECTOR,
+) -> List[ICTMatch]:
+    """Fetch Binance USDT-M futures data via CCXT and run the ICT scanner."""
+    exchange = _build_ccxt_exchange()
+    if not exchange:
         return []
-    return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
 
-
-def _parse_bool_token(token: str) -> bool:
-    normalized = token.strip().lower()
-    if normalized in {"1", "true", "yes", "on", "y", "enable", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "off", "n", "disable", "disabled"}:
-        return False
-    raise ValueError(f"قيمة منطقية غير صالحة: {token!r}")
-
-
-class _OptionalBoolAction(argparse.Action):
-    """argparse action allowing ``--flag`` or ``--flag=false`` patterns."""
-
-    def __init__(self, option_strings, dest, **kwargs):  # type: ignore[override]
-        if "nargs" in kwargs:
-            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs")
-        kwargs.setdefault("default", False)
-        super().__init__(option_strings, dest, nargs="?", **kwargs)
-
-    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
-        if values is None:
-            setattr(namespace, self.dest, True)
-            return
-        try:
-            parsed = _parse_bool_token(str(values))
-        except ValueError as exc:
-            parser.error(str(exc))
-        setattr(namespace, self.dest, parsed)
-
-
-# ----------------------------- CLI Settings ----------------------------------
-@dataclass
-class _CLISettings:
-    # indicator toggles that exist in port (wired where safe)
-    showHL: bool = False
-    showMn: bool = False
-    showISOB: bool = True
-    showMajoinMiner: bool = False
-    showCircleHL: bool = True
-    showSMC: bool = True
-    lengSMC: int = 40
-    swing_size: int = 10
-    show_fvg: bool = True
-    show_liquidity: bool = True
-    liquidity_display_limit: int = 20
-    drop_last_incomplete: bool = False
-    # scanner controls
-    tg_enable: bool = False
-    tg_title_prefix: str = "SMC Alert"
-    # matching indicator behavior
-    ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
-    zone_type: str = "Mother Bar"  # goes to order_block.poi_type
-    bos_confirmation: str = "Close"
-    strict_close_for_break: bool = False
-    # filters
-    market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
-    max_scan: int = 60            # after filtering & sorting
-    allow_meme: bool = False
-    exclude_symbols: str = ""
-    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
-    include_only: str = ""
-
-def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
-
-def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
-    if not cfg.tg_enable:
-        return
-    token = _get_secret("TELEGRAM_BOT_TOKEN")
-    chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
-
-# ----------------------------- Symbol Picker ----------------------------------
-def _build_exchange(market: str):
-    # Futures-only
-    return ccxt.binanceusdm({"enableRateLimit": True})
-
-def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
-    if symbol_override:
-        return [symbol_override.strip().upper()]
-    ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
-    if cfg.market == "usdtm":
-        universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
-    else:
-        universe = [s for s, m in markets.items() if m.get("spot") and m.get("quote") == "USDT"]
-    try:
-        ticks = ex.fetch_tickers(universe)
-    except Exception:
-        # fallback: greedy highest-volume
-        universe_sorted = sorted(universe)[:min(max_symbols_hint, cfg.max_scan)]
-        return universe_sorted
-
-    excl_syms = set(_normalize_list(cfg.exclude_symbols))
-    excl_patterns = set(_normalize_list(cfg.exclude_patterns))
-    inc_only = set(_normalize_list(cfg.include_only))
-
-    def allow(sym: str) -> bool:
-        u = sym.upper()
-        if u in excl_syms:
-            return False
-        b = _base(sym).upper()
-        if inc_only and not any(k in b for k in inc_only):
-            return False
-        if not cfg.allow_meme:
-            if b in _MEME_BASES:
-                return False
-            if any(p in b for p in excl_patterns):
-                return False
-        t = ticks.get(sym) or {}
-        pct_change = _pct_24h(t)
-        if cfg.min_change is not None and pct_change < cfg.min_change:
-            return False
-        if _qv_24h(t) < cfg.min_volume:
-            return False
-        return True
-
-    cands = [s for s in universe if allow(s)]
-    cands.sort(key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-    if not cands:
-        cands = sorted(universe, key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-        if not cfg.allow_meme:
-            cands = [s for s in cands if _base(s).upper() not in _MEME_BASES]
-    return cands[:min(cfg.max_scan, max_symbols_hint)]
-
-# ----------------------------- CLI & Router -----------------------------------
-def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
-    p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
-    # market / selection
-    p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
-    # timeframe/limit
-    p.add_argument("--timeframe", "-t", default="1m")
-    p.add_argument("--limit", "-l", type=int, default=800)
-    p.add_argument("--drop-last", action="store_true", default=False)
-    # indicator view toggles
-    p.add_argument("--show-hl", action="store_true", default=False)
-    p.add_argument("--show-mn", action="store_true", default=False)
-    p.add_argument("--show-isob", dest="show_isob", action="store_true")
-    p.add_argument("--no-isob", dest="show_isob", action="store_false")
-    p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
-    p.add_argument("--show-circle-hl", action="store_true", default=True)
-    p.add_argument("--no-smc", action="store_true")
-    p.add_argument("--leng-smc", type=int, default=40)
-    p.add_argument("--swing-size", type=int, default=10)
-    p.add_argument("--no-fvg", action="store_true")
-    p.add_argument("--no-liquidity", action="store_true")
-    p.add_argument("--liquidity-limit", type=int, default=20)
-    # behavior/alerts (output only)
-    p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
-    p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    p.add_argument("--no-bos-plus", action="store_true")
-    p.add_argument("--no-ob-break", action="store_true")
-    p.add_argument("--no-ote", action="store_true")
-    p.add_argument("--no-ote-alert", action="store_true")
-    p.add_argument("--no-mark-x", action="store_true")
-    # filters
-    p.add_argument("--min-change", type=float, default=5.0)
-    p.add_argument("--min-volume", type=float, default=30_000_000.0)
-    p.add_argument("--max-scan", type=int, default=60)
-    p.add_argument("--allow-meme", action="store_true", default=False)
-    p.add_argument("--exclude-symbols", default="")
-    p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
-    p.add_argument("--include-only", default="")
-    # misc
-    p.add_argument("--recent", type=int, default=2)
-    p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--debug", action="store_true", default=False)
-    p.add_argument("--tg", action="store_true", default=False)
-    args, _ = p.parse_known_args()
-
-    cfg = _CLISettings(
-        market='usdtm',  # forced futures-only
-        showHL=args.show_hl,
-        showMn=args.show_mn,
-        showISOB=True if args.show_isob is None else args.show_isob,
-        showMajoinMiner=args.show_major_minor,
-        showCircleHL=args.show_circle_hl,
-        showSMC=not args.no_smc,
-        lengSMC=args.leng_smc,
-        swing_size=args.swing_size,
-        show_fvg=not args.no_fvg,
-        show_liquidity=not args.no_liquidity,
-        liquidity_display_limit=args.liquidity_limit,
-        tg_enable=args.tg,
-        ob_test_mode=args.mitigation,
-        bos_confirmation=args.bos_confirmation,
-        strict_close_for_break=(args.bos_confirmation == "Close"),
-        min_change=args.min_change,
-        min_volume=args.min_volume,
-        max_scan=args.max_scan,
-        allow_meme=args.allow_meme,
-        exclude_symbols=args.exclude_symbols,
-        exclude_patterns=args.exclude_patterns,
-        include_only=args.include_only,
-        drop_last_incomplete=args.drop_last,
+    symbols = _select_binance_usdtm_symbols(
+        exchange, max_symbols=max_symbols, selector=selector
     )
-    return cfg, args
+    if not symbols:
+        print("لا توجد رموز USDT-M صالحة للمسح.")
+        return []
 
-def _should_route_android(argv: List[str]) -> bool:
-    knobs = {
-        "--symbol","-s","--max-symbols","-n","--timeframe","-t","--limit","-l","--drop-last",
-        "--show-hl","--show-mn","--show-isob","--no-isob","--show-major-minor","--show-circle-hl","--no-smc",
-        "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
-        "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
-        "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
+    def _fetch_symbol(symbol: str) -> Tuple[str, List[Dict[str, float]]]:
+        try:
+            data = _fetch_ohlcv(exchange, symbol, timeframe, limit)
+        except Exception as exc:  # pragma: no cover - network dependency
+            if params and params.get("verbose"):
+                print(f"[{symbol}] فشل جلب البيانات: {exc}")
+            return symbol, []
+        if recent_bars:
+            data = data[-recent_bars:]
+        return symbol, data
+
+    candles_by_symbol: Dict[str, List[Dict[str, float]]] = {}
+    max_workers = min(6, max(1, len(symbols)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_symbol, symbol): symbol for symbol in symbols}
+        for future in concurrent.futures.as_completed(futures):
+            symbol, data = future.result()
+            if data:
+                candles_by_symbol[symbol] = data
+            elif params and params.get("verbose"):
+                print(f"[{symbol}] لا توجد بيانات كافية.")
+
+    return scan_symbols(candles_by_symbol, params=params)
+
+
+def _android_autorun() -> None:
+    """Minimal autorun hook for Android editors (run button)."""
+    defaults = EDITOR_AUTORUN_DEFAULTS
+    if ccxt is None:
+        print("CCXT غير مثبت. ثبت الحزمة ثم أعد التشغيل.")
+        print("Scanner ready. Provide OHLCV data to scan_symbols().")
+        return
+
+    params = {
+        "scan_mode": SCAN_MODE,
+        "entry_mode": ENTRY_MODE,
+        "max_setup_age_bars": MAX_SETUP_AGE_BARS,
+        "disp_atr_k": DISP_ATR_K,
+        "disp_body_ratio": DISP_BODY_RATIO,
+        "fvg_max_age_bars": FVG_MAX_AGE_BARS,
+        "verbose": VERBOSE,
     }
-    return any(a in knobs for a in argv)
 
-# ----------------------------- Runner -----------------------------------------
-
-# ===================== Arabic Renderer (format only) ==========================
-def _ar_num(x):
-    try:
-        if isinstance(x, (int, float)):
-            if abs(x) >= 1e6:
-                return f"{x/1e6:.2f}M"
-            if abs(x) >= 1e3:
-                return f"{x/1e3:.2f}K"
-            return f"{x:.4f}" if isinstance(x, float) else str(x)
-        return str(x)
-    except Exception:
-        return str(x)
-
-_AR_KEYS = {
-    "PULLBACK": ["pullback"],
-    "CHOCH"   : ["choch", "ch o ch", "chöch"],
-    "BOS"     : ["bos", "b 0 s"],
-    "IDM"     : ["idm"],
-    "DEMAND"  : ["demand", "طلب"],
-    "SUPPLY"  : ["supply", "عرض"],
-    "FVG_UP"  : ["fvg up", "fvg صاعدة", "fvg↑"],
-    "FVG_DN"  : ["fvg down", "fvg هابطة", "fvg↓"],
-    "OF_BOX"  : ["order flow", "flow box"],
-    "LIQ"     : ["liquidity", "سيولة"],
-    "SCOB"    : ["scob"],
-}
-# Buckets for "latest per logic"
-_LAST_BUCKETS = {
-    "BOS": ["bos", "b 0 s"],
-    "CHOCH": ["choch", "ch o ch"],
-    "Golden zone": ["golden zone"],
-    "IDM": ["idm @", " i d m "],
-    "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
-    "IDM OB": ["idm ob"],
-    "Hist IDM OB": ["hist idm ob"],
-    "Hist EXT OB": ["hist ext ob"],
-    "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
-    "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
-}
-# ---- Bind to indicator metrics if available ----
-_METRIC_MAP = {
-    "BOS": ["BOS", "bos"],
-    "CHOCH": ["CHOCH", "choch"],
-    "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
-    "IDM": ["IDM", "idm"],
-    "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
-    "IDM OB": ["IDM_OB", "idm_ob"],
-    "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
-    "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
-    "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
-    "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
-}
-
-def _ci_get(d, key):
-    # case-insensitive get for dict
-    if not isinstance(d, dict):
-        return None
-    if key in d:
-        return d[key]
-    lk = key.lower()
-    for k,v in d.items():
-        try:
-            if str(k).lower() == lk:
-                return v
-        except Exception:
-            pass
-    return None
-
-def _extract_latest_from_runtime(runtime):
-    """
-    Return dict: {label: (ts_ms, display_str)} using runtime.gather_console_metrics() if present.
-    Fallback to alerts keyword scan.
-    """
-    result = {}
-    # 1) Prefer structured metrics
-    try:
-        if hasattr(runtime, "gather_console_metrics"):
-            m = runtime.gather_console_metrics() or {}
-            latest = _ci_get(m, "latest_events") or {}
-            # Some implementations store lists per key or dicts with 'display'/'ts'
-            for label, keys in _METRIC_MAP.items():
-                found = None
-                for k in keys:
-                    candidate = latest.get(k) if isinstance(latest, dict) else None
-                    if candidate is None and isinstance(latest, dict):
-                        # try case-insensitive
-                        candidate = _ci_get(latest, k)
-                    if candidate is None:
-                        continue
-                    if isinstance(candidate, dict):
-                        ts = candidate.get("ts") or candidate.get("time") or candidate.get("timestamp")
-                        disp = candidate.get("display") or candidate.get("text") or candidate.get("title") or str(candidate)
-                        found = (ts or 0, disp)
-                        break
-                    if isinstance(candidate, (list, tuple)) and candidate:
-                        # assume list of dicts or tuples
-                        c = candidate[-1]
-                        if isinstance(c, dict):
-                            ts = c.get("ts") or c.get("time") or c.get("timestamp")
-                            disp = c.get("display") or c.get("text") or c.get("title") or str(c)
-                            found = (ts or 0, disp)
-                        elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                            found = (c[0], c[1])
-                        else:
-                            found = (0, str(c))
-                        break
-                    # fallback: just a string
-                    if isinstance(candidate, str):
-                        found = (0, candidate)
-                        break
-                if found:
-                    result[label] = found
-    except Exception:
-        pass
-
-    # 2) Fallback from alerts text if not found
-    if (not result) and hasattr(runtime, "alerts"):
-        alerts = list(getattr(runtime, "alerts"))
-        for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-            if item is not None:
-                result[name] = item
-    return result
-
-def _last_by_keywords(alerts, mapping):
-    # alerts: [(ts_ms, title)]
-    latest = {}
-    for ts, title in alerts:
-        t = (title or "").lower()
-        for name, kws in mapping.items():
-            if any(kw in t for kw in kws):
-                if name not in latest or ts > latest[name][0]:
-                    latest[name] = (ts, title)
-    # return ordered list according to mapping keys
-    out = []
-    for name in mapping.keys():
-        out.append((name, latest.get(name)))
-    return out
-
-
-def _count_by_keywords(alerts):
-    out = {k: 0 for k in _AR_KEYS}
-    for _, title in alerts:
-        t = (title or "").lower()
-        for key, kws in _AR_KEYS.items():
-            if any(kw in t for kw in kws):
-                out[key] += 1
-    return out
-
-def _fetch_pct_change(exchange, symbol):
-    try:
-        t = exchange.fetch_ticker(symbol)
-        v = t.get("percentage")
-        if v is None and isinstance(t.get("info"), dict):
-            v = t["info"].get("priceChangePercent")
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
-    ln = 0
-    try:
-        ln = runtime.series.length()
-    except Exception:
-        pass
-    last_close = None
-    try:
-        last_close = runtime.series.get("close")
-    except Exception:
-        pass
-    pct = _fetch_pct_change(exchange, symbol)
-    pct_s = f"{pct:+.2f}%" if pct is not None else "—"
-
-    hdr = f"{_format_symbol(symbol)} ({timeframe}) تحليل"
-    print(f"\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
-
-    counts = _count_by_keywords(recent_alerts)
-    def c(k): return counts.get(k, 0)
-
-    print("\nعدد التنبيهات :", len(recent_alerts))
-    print("إشارات Pullback :", c("PULLBACK"))
-    print("علامات CHoCH    :", c("CHOCH"))
-    print("علامات BOS      :", c("BOS"))
-    print("علامات IDM      :", c("IDM"))
-    print("مناطق الطلب     :", c("DEMAND"))
-    print("مناطق العرض     :", c("SUPPLY"))
-    box_tally = getattr(runtime, "console_box_status_tally", {})
-
-    def _box_total(name: str, statuses: Sequence[str]) -> int:
-        if not isinstance(box_tally, dict):
-            return 0
-        counter = box_tally.get(name, {})
-        if not isinstance(counter, dict):
-            return 0
-        total = 0
-        for status in statuses:
-            value = counter.get(status, 0)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-
-    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
-    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
-    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
-    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
-    print("فجوات FVG صاعدة :", c("FVG_UP"))
-    print("فجوات FVG هابطة :", c("FVG_DN"))
-    print("صناديق Order Flow:", c("OF_BOX"))
-    print("مستويات السيولة :", c("LIQ"))
-    print("شموع SCOB       :", c("SCOB"))
-
-    print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
-        print("—")
-    else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item:
-                continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Construct indicator inputs (no changes to core logic)
-    try:
-        (
-            SmartMoneyAlgoProE5,
-            IndicatorInputs,
-            PullbackInputs,
-            MarketStructureInputs,
-            OrderFlowInputs,
-            FVGInputs,
-            LiquidityInputs,
-            DemandSupplyInputs,
-            OrderBlockInputs,
-            StructureInputs,
-            ICTMarketStructureInputs,
-            fetch_ohlcv,
-            _parse_timeframe_to_seconds,
+    def _run_once() -> None:
+        scan_binance_usdtm(
+            timeframe=defaults.timeframe,
+            limit=defaults.candle_limit,
+            max_symbols=defaults.max_symbols,
+            recent_bars=defaults.recent_bars,
+            params=params,
         )
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)  # canonicalized inside
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
-    )
-
-    # Run loop
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(
-                inputs=inputs,
-                base_timeframe=args.timeframe,
-                recent_bars=recent_window,
-            )
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            cutoff_time = runtime.series.get_time(cutoff_idx)
-            recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
-                    )
-                )
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            if summary:
-                print("  •", " | ".join(summary))
-            for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                colored_title = _colorize_directional_text(title)
-                print(f"  - {ts_s} :: {colored_title}")
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
-    return 0
-
-
-
-def __router_main__():
-    import sys
-    # Try to use embedded CLI when available
-    try:
-        use_cli = _should_route_android(sys.argv[1:])
-    except Exception:
-        use_cli = False
-    if use_cli and ('_android_cli_entry' in globals()):
-        try:
-            return _android_cli_entry()
-        except Exception:
-            pass
-    # Fallback to original main() if present
-    try:
-        return main()  # type: ignore
-    except Exception:
-        return 0
-
-
-# ============================================================================
-
-
-
-# === Auto-args when launched from editor (no CLI flags) ====== FUTURES-ONLY ==
-def __editor_autoargs__():
-    import sys
-    if len(sys.argv) == 1:  # no flags -> inject defaults
-        sys.argv += [
-            "-t", "1m", "-l", "600",
-            "--min-change", "5",
-            "--min-volume", "30000000",
-            "--max-scan", "60",
-            "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
-            "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
-            "--verbose"
-        ]
-
-# ========================= Arabic Console Renderer & CLI (Futures-only) =========================
-import sys, time
-try:
-    import ccxt  # لبيانات بينانس
-except Exception:
-    ccxt = None
-
-# ---------- Arabic renderer helpers ----------
-def _ar_num(x):
-    try:
-        if isinstance(x, (int,float)):
-            if abs(x) >= 1e6: return f"{x/1e6:.2f}M"
-            if abs(x) >= 1e3: return f"{x/1e3:.2f}K"
-            return f"{x:.6f}" if isinstance(x,float) else str(x)
-        return str(x)
-    except Exception:
-        return str(x)
-
-_AR_KEYS = {
-    "PULLBACK": ["pullback"],
-    "CHOCH"   : ["choch","ch o ch"],
-    "BOS"     : ["bos","b 0 s"],
-    "IDM"     : ["idm"," i d m "],
-    "DEMAND"  : ["demand","طلب"],
-    "SUPPLY"  : ["supply","عرض"],
-    "FVG_UP"  : ["fvg up","fvg صاعدة","fvg↑"],
-    "FVG_DN"  : ["fvg down","fvg هابطة","fvg↓"],
-    "OF_BOX"  : ["order flow","flow box"],
-    "LIQ"     : ["liquidity","سيولة"],
-    "SCOB"    : ["scob"],
-}
-
-# منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
-_LAST_BUCKETS = {
-    "BOS": ["bos","b 0 s"],
-    "CHOCH": ["choch","ch o ch"],
-    "Golden zone": ["golden zone","gz"],
-    "IDM": ["idm"," i d m "],
-    "EXT OB": ["ext ob","ext_ob"],
-    "IDM OB": ["idm ob","idm_ob"],
-    "Hist IDM OB": ["hist idm ob","hist_idm_ob"],
-    "Hist EXT OB": ["hist ext ob","hist_ext_ob"],
-    "الدوائر الحمراء": ["الدوائر الحمراء","red circle"],
-    "الدوائر الخضراء": ["الدوائر الخضراء","green circle"],
-}
-
-def _last_by_keywords(alerts, mapping):
-    latest = {}
-    for ts, title in alerts:
-        t = (title or "").lower()
-        for name, kws in mapping.items():
-            if any(kw in t for kw in kws):
-                if name not in latest or ts > latest[name][0]:
-                    latest[name] = (ts, title)
-    return [(name, latest.get(name)) for name in mapping.keys()]
-
-# ---------- Bind strongly to runtime internals ----------
-def _ci_get(d, key):
-    if not isinstance(d, dict):
-        return None
-    if key in d: return d[key]
-    lk = str(key).lower()
-    for k,v in d.items():
-        try:
-            if str(k).lower() == lk: return v
-        except Exception:
-            pass
-    return None
-
-def _take_last(value):
-    if value is None: return None
-    if isinstance(value, dict):
-        ts = value.get("ts") or value.get("time") or value.get("timestamp") or 0
-        disp = value.get("display") or value.get("text") or value.get("title") or str(value)
-        return (ts, disp)
-    if isinstance(value, (list,tuple)) and value:
-        return _take_last(value[-1])
-    if isinstance(value, str):
-        return (0, value)
-    return (0, str(value))
-
-_INT_KEYS = [
-    ("latest_events",), ("latest",), ("last",),
-    ("markers",), ("events",), ("signals",),
-]
-
-_METRIC_MAP = {
-    "BOS": ["BOS","bos","b 0 s"],
-    "CHOCH": ["CHOCH","choch","ch o ch"],
-    "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
-    "IDM": ["IDM","idm"," i d m "],
-    "EXT OB": ["EXT_OB","ext_ob","ext ob"],
-    "IDM OB": ["IDM_OB","idm_ob","idm ob"],
-    "Hist IDM OB": ["HIST_IDM_OB","hist_idm_ob","hist idm ob"],
-    "Hist EXT OB": ["HIST_EXT_OB","hist_ext_ob","hist ext ob"],
-    "الدوائر الحمراء": ["RED_CIRCLE","red_circle","الدوائر الحمراء","red circle"],
-    "الدوائر الخضراء": ["GREEN_CIRCLE","green_circle","الدوائر الخضراء","green circle"],
-}
-
-def _extract_from_metrics_dict(mdict):
-    out = {}
-    if not isinstance(mdict, dict): return out
-    roots = []
-    for path in _INT_KEYS:
-        node = mdict
-        ok = True
-        for p in path:
-            node = _ci_get(node, p)
-            if node is None: ok = False; break
-        if ok and node is not None:
-            roots.append(node)
-    for label, keys in _METRIC_MAP.items():
-        found = None
-        for root in roots:
-            if isinstance(root, dict):
-                for k in keys + [label]:
-                    cand = _ci_get(root, k)
-                    if cand is None: continue
-                    last = _take_last(cand)
-                    if last: found = last; break
-            if found: break
-        if found: out[label] = found
-    return out
-
-def _extract_latest_from_runtime(runtime):
-    # 1) خصائص مباشرة على الـruntime
-    for root_name in ["latest_events","latest","last","markers","events","signals","state","summary"]:
-        node = getattr(runtime, root_name, None)
-        out = _extract_from_metrics_dict(node)
-        if out: return out
-    # 2) gather_console_metrics
-    try:
-        if hasattr(runtime, "gather_console_metrics"):
-            m = runtime.gather_console_metrics() or {}
-            out = _extract_from_metrics_dict(m)
-            if out: return out
-    except Exception:
-        pass
-    # 3) سقوط إلى نصوص التنبيهات فقط
-    alerts = list(getattr(runtime, "alerts", []))
-    latest = {}
-    for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-        if item is not None: latest[name] = item
-    return latest
-
-def _fetch_pct_change(exchange, symbol):
-    try:
-        t = exchange.fetch_ticker(symbol)
-        v = t.get("percentage")
-        if v is None and isinstance(t.get("info"), dict):
-            v = t["info"].get("priceChangePercent")
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
-    ln, last_close = 0, None
-    try: ln = runtime.series.length()
-    except Exception: pass
-    try: last_close = runtime.series.get("close")
-    except Exception: pass
-    pct = _fetch_pct_change(exchange, symbol)
-    pct_s = f"{pct:+.2f}%" if pct is not None else "—"
-
-    disp_sym = symbol.replace(':USDT','')
-    hdr = f"{_format_symbol(disp_sym)} ({timeframe}) تحليل"
-    print(f"\\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
-
-    # عدادات (من نصوص التنبيهات فقط)
-    def _count_by_keywords(alerts):
-        out = {k: 0 for k in _AR_KEYS}
-        for _, title in alerts:
-            t = (title or "").lower()
-            for key, kws in _AR_KEYS.items():
-                if any(kw in t for kw in kws):
-                    out[key] += 1
-        return out
-    counts = _count_by_keywords(recent_alerts)
-    c = lambda k: counts.get(k,0)
-    print("\\nعدد التنبيهات :", len(recent_alerts))
-    print("إشارات Pullback :", c("PULLBACK"))
-    print("علامات CHoCH    :", c("CHOCH"))
-    print("علامات BOS      :", c("BOS"))
-    print("علامات IDM      :", c("IDM"))
-    print("مناطق الطلب     :", c("DEMAND"))
-    print("مناطق العرض     :", c("SUPPLY"))
-    box_tally = getattr(runtime, "console_box_status_tally", {})
-
-    def _box_total(name: str, statuses: Sequence[str]) -> int:
-        if not isinstance(box_tally, dict):
-            return 0
-        counter = box_tally.get(name, {})
-        if not isinstance(counter, dict):
-            return 0
-        total = 0
-        for status in statuses:
-            value = counter.get(status, 0)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-
-    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
-    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
-    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
-    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
-    print("فجوات FVG صاعدة :", c("FVG_UP"))
-    print("فجوات FVG هابطة :", c("FVG_DN"))
-    print("صناديق Order Flow:", c("OF_BOX"))
-    print("مستويات السيولة :", c("LIQ"))
-    print("شموع SCOB       :", c("SCOB"))
-
-    print("\\nأحدث الإشارات مع الأسعار")
-    latest = _extract_latest_from_runtime(runtime)
-    if not latest:
-        print("—")
-    else:
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item: continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
-
-# ---------- Live exchange helpers (Futures-only) ----------
-def _build_exchange(_market_forced_usdtm:str="usdtm"):
-    return ccxt.binanceusdm({"enableRateLimit": True})
-
-def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-# ---------- Settings & argument parsing ----------
-class Settings:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-        self.market = 'usdtm'
-        self.max_scan = kw.get("max_scan", 60)
-        self.drop_last_incomplete = kw.get("drop_last_incomplete", False)
-        self.showHL = kw.get("showHL", False)
-        self.showMn = kw.get("showMn", False)
-        self.showISOB = kw.get("showISOB", True)
-        self.showMajoinMiner = kw.get("showMajoinMiner", False)
-        self.showCircleHL = kw.get("showCircleHL", True)
-        self.showSMC = kw.get("showSMC", True)
-        self.lengSMC = kw.get("lengSMC", 40)
-        self.swing_size = kw.get("swing_size", 10)
-        self.swing_length = kw.get("swing_length", 50)
-        self.show_fvg = kw.get("show_fvg", True)
-        self.show_liquidity = kw.get("show_liquidity", True)
-        self.liquidity_display_limit = kw.get("liquidity_display_limit", 20)
-        self.bos_confirmation = kw.get("bos_confirmation", "Close")
-        self.ob_test_mode = kw.get("ob_test_mode", "CLOSE")
-        self.show_brk_ob = kw.get("show_brk_ob", True)
-        self.extend_box_on_break = kw.get("extend_box_on_break", True)
-        self.show_mark_x = kw.get("show_mark_x", True)
-        self.enable_alert_ob_break = kw.get("enable_alert_ob_break", True)
-        self.enable_alert_mark_x = kw.get("enable_alert_mark_x", True)
-        self.enable_alert_bos_plus = kw.get("enable_alert_bos_plus", True)
-        self.bos_plus_retest_window = kw.get("bos_plus_retest_window", 2)
-        self.show_ote = kw.get("show_ote", True)
-        self.enable_alert_ote_touch = kw.get("enable_alert_ote_touch", True)
-        self.strict_close_for_break = kw.get("strict_close_for_break", False)
-        self.structure_requires_sweep = kw.get("structure_requires_sweep", False)
-        self.structure_requires_wick = kw.get("structure_requires_wick", False)
-        self.mtf_lookahead = kw.get("mtf_lookahead", False)
-        self.zone_type = kw.get("zone_type", "Mother Bar")
-        raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
-        try:
-            self.min_change = float(raw_threshold) if raw_threshold is not None else None
-        except (TypeError, ValueError):
-            self.min_change = None
-        raw_window = kw.get(
-            "height_candle_window",
-            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
-        )
-        try:
-            parsed_window = int(raw_window) if raw_window is not None else None
-        except (TypeError, ValueError):
-            parsed_window = None
-        if parsed_window is not None and parsed_window <= 0:
-            parsed_window = None
-        self.height_candle_window = parsed_window
-        raw_metric = kw.get("height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
-        if isinstance(raw_metric, str):
-            metric_value = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-        elif raw_metric is None:
-            metric_value = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-        else:
-            metric_value = str(raw_metric)
-        self.height_metric = metric_value
-        scope_value = kw.get("height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
-        if isinstance(scope_value, str):
-            stripped_scope = scope_value.strip()
-            self.height_scope = stripped_scope or None
-        else:
-            self.height_scope = None
-        raw_continuous = kw.get("continuous_scan", EDITOR_AUTORUN_DEFAULTS.continuous_scan)
-        if isinstance(raw_continuous, str):
-            normalized = raw_continuous.strip().lower()
-            if normalized in ("", "0", "false", "no", "off"):
-                continuous_value = False
-            elif normalized in ("1", "true", "yes", "on"):
-                continuous_value = True
-            else:
-                continuous_value = EDITOR_AUTORUN_DEFAULTS.continuous_scan
-        else:
-            continuous_value = bool(raw_continuous)
-        self.continuous_scan = continuous_value
-        raw_interval = kw.get("continuous_interval", EDITOR_AUTORUN_DEFAULTS.scan_interval)
-        try:
-            parsed_interval = float(raw_interval)
-        except (TypeError, ValueError):
-            parsed_interval = EDITOR_AUTORUN_DEFAULTS.scan_interval
-        self.continuous_interval = parsed_interval if parsed_interval >= 0 else 0.0
-
-def _parse_args_android():
-    import argparse
-    p = argparse.ArgumentParser(prog="SMC Binance Scanner (Android single-file)")
-    p.add_argument("--timeframe", "-t", default=EDITOR_AUTORUN_DEFAULTS.timeframe)
-    p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
-    p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
-    p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
-    p.add_argument("--tg", action="store_true", default=False)
-    p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--recent", type=int, default=EDITOR_AUTORUN_DEFAULTS.recent_bars)
-    p.add_argument("--drop-last", action="store_true", default=False)
-    p.add_argument("--debug", action="store_true", default=False)
-    p.add_argument("--show-hl", action="store_true", default=False)
-    p.add_argument("--show-mn", action="store_true", default=False)
-    p.add_argument("--show-isob", dest="show_isob", action="store_true")
-    p.add_argument("--no-isob", dest="show_isob", action="store_false")
-    p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
-    p.add_argument("--show-circle-hl", action="store_true", default=True)
-    p.add_argument("--no-smc", action="store_true")
-    p.add_argument("--leng-smc", type=int, default=40)
-    p.add_argument("--swing-size", type=int, default=10)
-    p.add_argument("--swing-length", type=int, default=50)
-    p.add_argument("--ob-test-mode", choices=["WICK","CLOSE"], default="CLOSE")
-    p.add_argument("--show-brk-ob", action="store_true", default=True)
-    p.add_argument("--strict-close-for-break", action="store_true", default=False)
-    p.add_argument("--structure-requires-sweep", action="store_true", default=False)
-    p.add_argument("--structure-requires-wick", action="store_true", default=False)
-    p.add_argument("--mtf-lookahead", action="store_true", default=False)
-    p.add_argument("--zone-type", choices=["---","Mother Bar"], default=None)
-    p.add_argument("--use-mother-bar", action="store_true", default=False)
-    p.add_argument("--no-mother-bar", action="store_true", default=False)
-    p.add_argument("--eps", type=float, default=0.0)
-    p.add_argument("--no-fvg", action="store_true")
-    p.add_argument("--no-liquidity", action="store_true")
-    p.add_argument("--liquidity-limit", type=int, default=20)
-    p.add_argument("--bos-plus-window", type=int, default=2)
-    p.add_argument("--no-bos-plus", action="store_true")
-    p.add_argument("--no-ob-break", action="store_true")
-    p.add_argument("--no-mark-x", action="store_true")
-    p.add_argument("--no-ote", action="store_true")
-    p.add_argument("--no-ote-alert", action="store_true")
-    p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    default_threshold = (
-        EDITOR_AUTORUN_DEFAULTS.height_threshold
-        if EDITOR_AUTORUN_DEFAULTS.height_threshold is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
-    )
-    p.add_argument("--min-change", type=float, default=default_threshold)
-    default_candle_window = (
-        EDITOR_AUTORUN_DEFAULTS.height_candle_window
-        if EDITOR_AUTORUN_DEFAULTS.height_candle_window is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
-    )
-    p.add_argument(
-        "--height-candles",
-        type=int,
-        default=default_candle_window,
-    )
-    default_scope = (
-        EDITOR_AUTORUN_DEFAULTS.height_scope
-        if EDITOR_AUTORUN_DEFAULTS.height_scope is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope
-    )
-    default_metric = (
-        EDITOR_AUTORUN_DEFAULTS.height_metric
-        if EDITOR_AUTORUN_DEFAULTS.height_metric is not None
-        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-    )
-    p.add_argument(
-        "--height-scope",
-        type=str,
-        default=default_scope or "",
-        help="الإطار الزمني الذي يستخدمه فلتر نسبة الارتفاع (مثال: 1m)",
-    )
-    p.add_argument(
-        "--height-metric",
-        type=str,
-        default=default_metric,
-        help="المقياس المستخدم لترتيب الرابحين {percentage, pricechange, lastprice}",
-    )
-    p.add_argument(
-        "--continuous",
-        "--continuous-scan",
-        dest="continuous",
-        action=_OptionalBoolAction,
-        default=EDITOR_AUTORUN_DEFAULTS.continuous_scan,
-        help="تشغيل المسح بشكل مستمر بدون توقف (يدعم true/false)",
-    )
-    p.add_argument(
-        "--no-continuous",
-        "--no-continuous-scan",
-        dest="continuous",
-        action="store_false",
-        help="تعطيل المسح المستمر (عند وجود --continuous في الإعدادات)",
-    )
-    p.add_argument(
-        "--continuous-interval",
-        type=float,
-        default=EDITOR_AUTORUN_DEFAULTS.scan_interval,
-        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous",
-    )
-    args = p.parse_args()
-
-    if args.limit <= 0:
-        p.error("--limit must be > 0")
-    if args.max_symbols <= 0:
-        p.error("--max-symbols must be > 0")
-    if args.recent <= 0:
-        p.error("--recent يجب أن يكون رقمًا موجبًا")
-    if args.height_candles is not None and args.height_candles <= 0:
-        p.error("--height-candles يجب أن يكون رقمًا موجبًا")
-    if args.continuous_interval < 0:
-        p.error("--continuous-interval يجب أن يكون رقمًا غير سالب")
-
-    zone_type = args.zone_type
-    if args.use_mother_bar:
-        zone_type = "Mother Bar"
-    elif args.no_mother_bar:
-        zone_type = "---"
-    if zone_type is None:
-        zone_type = "Mother Bar"
-
-    height_scope = None
-    if isinstance(args.height_scope, str):
-        stripped_scope = args.height_scope.strip()
-        height_scope = stripped_scope or None
-
-    height_metric = args.height_metric.strip() if isinstance(args.height_metric, str) else ""
-    if not height_metric:
-        height_metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-
-    cfg = Settings(
-        eps=args.eps,
-        enable_alert_bos=True,
-        enable_alert_choch=True,
-        enable_alert_idm_touch=True,
-        mitigation_mode=args.mitigation,
-        merge_ratio=0.10,
-        tg_enable=args.tg,
-        tg_title_prefix="SMC Alert",
-        showHL=args.show_hl,
-        showMn=args.show_mn,
-        showISOB=True if args.show_isob is None else args.show_isob,
-        showMajoinMiner=args.show_major_minor,
-        showCircleHL=args.show_circle_hl,
-        showSMC=not args.no_smc,
-        lengSMC=args.leng_smc if hasattr(args,'leng_smc') else 40,
-        swing_size=args.swing_size,
-        swing_length=args.swing_length,
-        show_fvg=not args.no_fvg,
-        show_liquidity=not args.no_liquidity,
-        liquidity_display_limit=args.liquidity_limit,
-        bos_confirmation=args.bos_confirmation,
-        ob_test_mode=args.ob_test_mode,
-        show_brk_ob=args.show_brk_ob,
-        extend_box_on_break=True,
-        show_mark_x=not args.no_mark_x,
-        enable_alert_ob_break=not args.no_ob_break,
-        enable_alert_mark_x=not args.no_mark_x,
-        enable_alert_bos_plus=not args.no_bos_plus,
-        bos_plus_retest_window=args.bos_plus_window,
-        show_ote=not args.no_ote,
-        enable_alert_ote_touch=not args.no_ote_alert,
-        strict_close_for_break=args.strict_close_for_break,
-        structure_requires_sweep=args.structure_requires_sweep,
-        structure_requires_wick=args.structure_requires_wick,
-        mtf_lookahead=args.mtf_lookahead,
-        zone_type=zone_type,
-        drop_last_incomplete=args.drop_last,
-        max_scan=args.max_symbols,
-        min_change=args.min_change,
-        height_candle_window=args.height_candles,
-        height_scope=height_scope,
-        height_metric=height_metric,
-        continuous_scan=args.continuous,
-        continuous_interval=args.continuous_interval,
-    )
-    return cfg, args
-
-# ---------- Symbols universe (Futures USDT-M only) ----------
-def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
-    ex = _build_exchange('usdtm')
-    explicit = (symbol_override or "").strip()
-    limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
-    try:
-        limit_value = int(limit_hint)
-    except (TypeError, ValueError):
-        limit_value = int(cfg.max_scan) if cfg.max_scan else 0
-    if limit_value < 0:
-        limit_value = 0
-
-    selector_threshold = getattr(cfg, "min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
-    try:
-        threshold = float(selector_threshold) if selector_threshold is not None else None
-    except (TypeError, ValueError):
-        threshold = None
-    raw_metric = getattr(cfg, "height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
-    if isinstance(raw_metric, str):
-        metric = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-    elif raw_metric is None:
-        metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
-    else:
-        metric = str(raw_metric)
-    raw_scope = getattr(cfg, "height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
-    if isinstance(raw_scope, str):
-        scope = raw_scope.strip()
-    else:
-        scope = None
-
-    selector = BinanceSymbolSelectorConfig(
-        prioritize_top_gainers=DEFAULT_BINANCE_SYMBOL_SELECTOR.prioritize_top_gainers,
-        top_gainer_metric=metric,
-        top_gainer_threshold=threshold,
-        top_gainer_scope=scope,
-        top_gainer_candle_window=getattr(
-            cfg,
-            "height_candle_window",
-            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
-        ),
-    )
-
-    selection = _binance_pick_symbols(
-        ex,
-        limit_value,
-        explicit or None,
-        selector,
-    )
-
-    symbols = selection.symbols
-    if explicit:
-        return symbols
-
-    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
-    filtered = [s for s in symbols if not any(b in s for b in ban)]
-    if not filtered:
-        filtered = symbols
-
-    if limit_value and limit_value > 0:
-        filtered = filtered[:limit_value]
-
-    return list(dict.fromkeys(filtered))
-
-# ---------- Android CLI entry ----------
-def _android_cli_entry() -> int:
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
-
-    ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
     try:
-        SmartMoneyAlgoProE5
-        IndicatorInputs
-        PullbackInputs
-        MarketStructureInputs
-        OrderFlowInputs
-        FVGInputs
-        LiquidityInputs
-        DemandSupplyInputs
-        OrderBlockInputs
-        StructureInputs
-        ICTMarketStructureInputs
-        fetch_ohlcv
-    except NameError as e:
-        print("Missing indicator class or inputs:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=cfg.show_ote, markX=cfg.show_mark_x)
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
-
-    inputs = IndicatorInputs(
-        pullback=pullback, structure=structure, order_flow=order_flow,
-        fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
-        structure_util=utils, ict_structure=ict,
-    )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
-
-    symbol_override = args.symbol or None
-    iteration = 0
-    try:
-        while True:
-            iteration += 1
-            if cfg.continuous_scan and iteration > 1:
-                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-
-            symbols = _pick_symbols(cfg, symbol_override=symbol_override, max_symbols_hint=args.max_symbols)
-            symbols = list(dict.fromkeys(symbols))
-            if cfg.max_scan:
-                try:
-                    symbols = symbols[: int(cfg.max_scan)]
-                except Exception:
-                    pass
-            alerts_total = 0
-
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(
-                        inputs=inputs,
-                        base_timeframe=args.timeframe,
-                        recent_bars=recent_window,
-                    )
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
-                )
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
-
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-                    try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
-
-                if recent_alerts or args.verbose:
-                    _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-                    alerts_total += len(recent_alerts)
-
-            if args.verbose:
-                print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
-
-            if not cfg.continuous_scan:
-                print(
-                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
-                    " لتشغيل المسح باستمرار استخدم --continuous=true أو عدّل"
-                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
-                    flush=True,
-                )
-                break
-            if cfg.continuous_interval > 0:
-                print(
-                    f"انتظار {cfg.continuous_interval:.2f} ثانية قبل تشغيل المسح التالي",
-                    flush=True,
-                )
-                time.sleep(cfg.continuous_interval)
-    except KeyboardInterrupt:
-        print("تم إيقاف المسح من قبل المستخدم.")
-    return 0
-
-# ---------- Router ----------
-def __router_main__():
-    if len(sys.argv) == 1:
-        defaults = EDITOR_AUTORUN_DEFAULTS
-        sys.argv += [
-            "-t", defaults.timeframe,
-            "-l", str(defaults.candle_limit),
-            "--max-symbols", str(defaults.max_symbols),
-            "--recent", str(defaults.recent_bars),
-            "--verbose",
-        ]
-        if defaults.height_threshold is not None:
-            sys.argv += ["--min-change", str(defaults.height_threshold)]
-        if defaults.height_candle_window is not None:
-            sys.argv += ["--height-candles", str(defaults.height_candle_window)]
-        if defaults.height_scope:
-            sys.argv += ["--height-scope", str(defaults.height_scope)]
-        if defaults.height_metric:
-            sys.argv += ["--height-metric", str(defaults.height_metric)]
         if defaults.continuous_scan:
-            sys.argv.append("--continuous")
-        if defaults.scan_interval > 0:
-            sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
-    return _android_cli_entry()
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
-
-
-# ============================================================================
-# === ICT Strategies Integration (Text-only Runner) — appended by assistant ===
-# ============================================================================
-"""
-هذا القسم يضيف "محرّك الاستراتيجيات" (Top 10 ICT) وتشغيلًا تلقائيًا من داخل الملف.
-- لا يغيّر أي دوال/فئات موجودة لديك (يعمل كطبقة عليا فقط).
-- يطبع سطرًا نصيًا واحدًا لكل إشارة مكتملة وفق الاستراتيجية المفعّلة.
-- إدارة مخاطر تلقائية: %2 من رصيد 100$ (يمكن ضبطها من السطرات أدناه أو عبر سطر الأوامر).
-- يدعم CSV أو ccxt (إن توفر) للفحص التاريخي 2022-01-01 → 2023-12-31 أو الوضع الحي.
-"""
-
-import argparse, csv, os, sys, math, time
-import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Literal
-
-# -------- إعدادات إفتراضية للتشغيل التلقائي من المحرّر --------
-DEFAULT_STRATEGY: str = "ICT 2022"   # بدّلها إلى أي اسم من القائمة المسموح بها أدناه
-DEFAULT_EQUITY: float = 100.0        # الرصيد بالدولار
-DEFAULT_RISK: float = 2.0            # نسبة المخاطرة لكل صفقة (%)
-DEFAULT_NY_OFFSET: int = -4          # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
-DEFAULT_SYMBOLS: str = "BTCUSDT"     # رموز مفصولة بفواصل
-DEFAULT_START: str = "2022-01-01"    # بداية الباكتيست
-DEFAULT_END: str   = "2023-12-31"    # نهاية الباكتيست
-DEFAULT_LIVE: bool = False           # الوضع الحي (يتطلب ccxt)
-DEFAULT_CSV: Optional[str] = None    # مثال: "BTCUSDT=./btc_1m.csv"
-
-# محاولـة تحميل ccxt إن توفّر
-try:
-    import ccxt  # type: ignore
-except Exception:
-    ccxt = None  # type: ignore
-
-
-# ---------------------- مساعدات بيانات الشموع ----------------------
-def _read_csv_series(path: str) -> List[Dict[str, float]]:
-    out: List[Dict[str, float]] = []
-    with open(path, newline="", encoding="utf-8") as fh:
-        rd = csv.DictReader(fh)
-        for row in rd:
-            out.append({
-                "time": int(row["time"]),
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": float(row.get("volume", 0.0)),
-            })
-    return out
-
-
-def _fetch_ohlcv_ccxt(exchange: "ccxt.binanceusdm", symbol: str, timeframe: str,
-                      since_ms: int, until_ms: int, limit: int = 1000) -> List[Dict[str, float]]:
-    out: List[Dict[str, float]] = []
-    since = since_ms
-    normalized_symbol = _binance_linear_symbol_from_id(symbol) or symbol
-    while True:
-        try:
-            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
-        except Exception as exc:
-            if ccxt is None or not isinstance(exc, getattr(ccxt, "BaseError", Exception)):
-                raise
-            # حاول مجددًا باستخدام معرّف REST "BTCUSDT" إن أمكن
-            fallback = _binance_linear_symbol_id(normalized_symbol)
-            if not fallback:
-                raise
-            normalized_symbol = fallback
-            batch = exchange.fetch_ohlcv(normalized_symbol, timeframe=timeframe, since=since, limit=limit)
-        if not batch:
-            break
-        for t, o, h, l, c, v in batch:
-            if t > until_ms:
-                return out
-            out.append({"time": t, "open": float(o), "high": float(h), "low": float(l), "close": float(c), "volume": float(v)})
-            since = t + 1
-        if len(batch) < limit or out[-1]["time"] >= until_ms:
-            break
-    return out
-
-
-# ---------------------- اكتشاف فئة المؤشّر في هذا الملف ----------------------
-@dataclass
-class _IndicatorAPI:
-    Klass: Any
-    inputs_ctor: Optional[Any]
-
-    @classmethod
-    def discover(cls) -> "_IndicatorAPI":
-        # نحاول تفضيل SmartMoneyAlgoProE5 إن وجد
-        mod = sys.modules.get(__name__)
-        cand = getattr(mod, "SmartMoneyAlgoProE5", None)
-        inputs = getattr(mod, "IndicatorInputs", None)
-        if cand is None:
-            # بديل: أول فئة لديها process([candle])
-            for name in dir(mod):
-                obj = getattr(mod, name)
-                if isinstance(obj, type) and hasattr(obj, "process"):
-                    cand = obj
-                    break
-        if cand is None:
-            raise RuntimeError("لا يمكن العثور على فئة مؤشر تحتوي على process([...]) داخل هذا الملف.")
-        return cls(Klass=cand, inputs_ctor=inputs)
-
-    def new_runtime(self):
-        if self.inputs_ctor is not None:
-            try:
-                return self.Klass(self.inputs_ctor())
-            except Exception:
-                pass
-        return self.Klass()
-
-
-# ---------------------- محرّك الاستراتيجيات (Top 10 ICT) ----------------------
-@dataclass
-class _Signal:
-    symbol: str
-    side: Literal["BUY", "SELL"]
-    entry: float
-    stop: float
-    strategy: str
-    t: int
-    reason: str = ""
-
-
-def _fmt(v: float) -> str:
-    s = f"{v:.6f}"
-    return s.rstrip("0").rstrip(".")
-
-
-def _pos_size(equity_usd: float, risk_pct: float, entry: float, stop: float) -> float:
-    risk_amt = max(equity_usd * (risk_pct / 100.0), 1e-9)
-    dist = abs(entry - stop)
-    if dist <= 0:
-        return 0.0
-    return risk_amt / dist
-
-
-def _utc_to_ny_minutes(ts_ms: int, ny_offset_hours: int) -> int:
-    tm = dt.datetime.utcfromtimestamp(ts_ms / 1000)
-    tm = tm + dt.timedelta(hours=ny_offset_hours)
-    return tm.hour * 60 + tm.minute
-
-
-def _extract_events(rt: Any) -> Dict[str, Any]:
-    for name in ("gather_console_metrics", "_collect_latest_console_events"):
-        if hasattr(rt, name):
-            try:
-                m = getattr(rt, name)()
-                if isinstance(m, dict):
-                    if "latest_events" in m and isinstance(m["latest_events"], dict):
-                        return m["latest_events"]
-                    return m
-            except Exception:
-                pass
-    for attr in ("console_event_log", "last_events", "events"):
-        v = getattr(rt, attr, None)
-        if isinstance(v, dict):
-            return v
-    return {}
-
-
-def _series_get(rt: Any, key: str, idx: int = 0) -> float:
-    try:
-        if hasattr(rt, "series"):
-            return float(rt.series.get(key, idx))
-    except Exception:
-        pass
-    return float("nan")
-
-
-def _last_time(rt: Any) -> int:
-    try:
-        if hasattr(rt, "series"):
-            return int(rt.series.get_time())
-    except Exception:
-        pass
-    return 0
-
-
-def _pdh_pdl(rt: Any) -> Tuple[Optional[float], Optional[float]]:
-    def _num(x):
-        try:
-            return float(x) if x == x else None
-        except Exception:
-            return None
-    return _num(getattr(rt, "pdh", None)), _num(getattr(rt, "pdl", None))
-
-
-def _has_fvg(rt: Any, bullish: bool) -> bool:
-    try:
-        holder = getattr(rt, "bullish_gap_holder" if bullish else "bearish_gap_holder", None)
-        if holder is None:
-            return False
-        size = holder.size() if hasattr(holder, "size") else (len(holder) if hasattr(holder, "__len__") else 0)
-        return size > 0
-    except Exception:
-        return False
-
-
-def _last_ob_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
-    arr = getattr(rt, "demandZone" if bullish else "supplyZone", None)
-    try:
-        if arr and arr.size() > 0:
-            box = arr.get(arr.size() - 1)
-            top = getattr(box, "top", None)
-            bottom = getattr(box, "bottom", None)
-            if top is not None and bottom is not None:
-                lo, hi = (float(bottom), float(top))
-                return (lo, hi)
-    except Exception:
-        pass
-    return None
-
-
-def _dir_from(events: Dict[str, Any], key: str) -> Optional[str]:
-    v = events.get(key, {})
-    d = v.get("direction")
-    if isinstance(d, str):
-        return d.lower()
-    return None
-
-
-def _swept_against_pdh_pdl(rt: Any) -> Optional[str]:
-    pdh, pdl = _pdh_pdl(rt)
-    lc = _series_get(rt, "close", 0)
-    pc = _series_get(rt, "close", 1)
-    if pdh is not None and pc <= pdh and lc > pdh:
-        return "up"
-    if pdl is not None and pc >= pdl and lc < pdl:
-        return "down"
-    return None
-
-
-class _StrategyEngine:
-    def __init__(self, rt: Any, symbol: str, *, equity: float, risk_pct: float, ny_offset: int) -> None:
-        self.rt = rt
-        self.symbol = symbol
-        self.equity = equity
-        self.risk_pct = risk_pct
-        self.ny_offset = ny_offset
-
-    def _print(self, sig: _Signal) -> None:
-        size = _pos_size(self.equity, self.risk_pct, sig.entry, sig.stop)
-        when = dt.datetime.utcfromtimestamp(sig.t/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
-              f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
-
-    def evaluate_and_print(self, name: str) -> None:
-        sig = self._evaluate(name)
-        if sig:
-            self._print(sig)
-
-    # ----------------- استراتيجيات (نسخة خفيفة) -----------------
-    def _evaluate(self, name: str) -> Optional[_Signal]:
-        name = (name or "").strip()
-        if name in ("", "ICT 2022"):
-            return self._ict_2022()
-        if name == "Silver Bullet":
-            return self._silver_bullet()
-        if name == "Judas Swing":
-            return self._judas()
-        if name == "Turtle Soup":
-            return self._turtle_soup()
-        if name == "OTE":
-            return self._ote()
-        if name == "PO3":
-            return self._po3()
-        if name == "Liquidity Sweep + OB":
-            return self._sweep_ob()
-        if name == "Breaker Block":
-            return self._breaker()
-        if name == "FVG Continuation":
-            return self._fvg_cont()
-        if name == "OSOK":
-            sig = self._ict_2022(require_killzone=True)
-            if sig:
-                sig.strategy = "OSOK"
-            return sig
-        return None
-
-    def _ict_2022(self, require_killzone: bool = False) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        if require_killzone:
-            minutes = _utc_to_ny_minutes(t, self.ny_offset)
-            if not (10*60 <= minutes < 11*60):
-                return None
-        swept = _swept_against_pdh_pdl(self.rt)
-        bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
-        bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
-        if swept == "down" and bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True)):
-            ob = _last_ob_zone(self.rt, True)
-            sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB")
-        if swept == "up" and bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False)):
-            ob = _last_ob_zone(self.rt, False)
-            sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB")
-        return None
-
-    def _silver_bullet(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        in_win = (3*60 <= minutes < 4*60) or (10*60 <= minutes < 11*60) or (14*60 <= minutes < 15*60)
-        if not in_win:
-            return None
-        price = _series_get(self.rt, "close", 0)
-        bull = _dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
-        bear = _dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
-        if bull and _has_fvg(self.rt, True):
-            ob = _last_ob_zone(self.rt, True)
-            sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Silver Bullet", t, "NY window + MSS↑ + FVG")
-        if bear and _has_fvg(self.rt, False):
-            ob = _last_ob_zone(self.rt, False)
-            sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Silver Bullet", t, "NY window + MSS↓ + FVG")
-        return None
-
-    def _judas(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        if not (3*60 <= minutes < 5*60):
-            return None
-        price = _series_get(self.rt, "close", 0)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if swept == "up" and (_dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "BOS") == "bearish"):
-            ob = _last_ob_zone(self.rt, False); sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Judas Swing", t, "London sweep↑ + shift↓")
-        if swept == "down" and (_dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "BOS") == "bullish"):
-            ob = _last_ob_zone(self.rt, True); sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Judas Swing", t, "London sweep↓ + shift↑")
-        return None
-
-    def _turtle_soup(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        pdh, pdl = _pdh_pdl(self.rt)
-        pc = _series_get(self.rt, "close", 1)
-        if pdh is not None and pc > pdh and price < pdh and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"):
-            sl = pdh + abs(price - pc)
-            return _Signal(self.symbol, "SELL", price, sl, "Turtle Soup", t, "fake breakout above PDH")
-        if pdl is not None and pc < pdl and price > pdl and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"):
-            sl = pdl - abs(price - pc)
-            return _Signal(self.symbol, "BUY", price, sl, "Turtle Soup", t, "fake breakdown below PDL")
-        return None
-
-    def _ote(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        gz = ev.get("GOLDEN_ZONE", {})
-        bounds = gz.get("price")
-        if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
-            lo, hi = float(bounds[0]), float(bounds[1])
-            if lo <= price <= hi and (_dir_from(ev, "BOS") in ("bullish","bearish") or _dir_from(ev, "MSS") in ("bullish","bearish")):
-                if _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish":
-                    return _Signal(self.symbol, "BUY", price, lo, "OTE", t, "inside OTE + bullish shift")
-                if _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish":
-                    return _Signal(self.symbol, "SELL", price, hi, "OTE", t, "inside OTE + bearish shift")
-        return None
-
-    def _po3(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        minutes = _utc_to_ny_minutes(t, self.ny_offset)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if (3*60 <= minutes < 8*60) and swept == "down" and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish"):
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "PO3", t, "AM sweep↓ -> distribution↑")
-        if (3*60 <= minutes < 8*60) and swept == "up" and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish"):
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "PO3", t, "AM sweep↑ -> distribution↓")
-        return None
-
-    def _sweep_ob(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        swept = _swept_against_pdh_pdl(self.rt)
-        if swept == "up" and _dir_from(ev, "BOS") == "bearish":
-            ob = _last_ob_zone(self.rt, False)
-            if ob:
-                return _Signal(self.symbol, "SELL", price, ob[1], "Liquidity Sweep + OB", t, "sweep↑ + bearish BOS + OB")
-        if swept == "down" and _dir_from(ev, "BOS") == "bullish":
-            ob = _last_ob_zone(self.rt, True)
-            if ob:
-                return _Signal(self.symbol, "BUY", price, ob[0], "Liquidity Sweep + OB", t, "sweep↓ + bullish BOS + OB")
-        return None
-
-    def _breaker(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        has_idm = "IDM_OB" in ev and isinstance(ev["IDM_OB"].get("price"), (list, tuple))
-        has_ext = "EXT_OB" in ev and isinstance(ev["EXT_OB"].get("price"), (list, tuple))
-        if has_idm and _dir_from(ev, "BOS") == "bearish":
-            lo, hi = map(float, ev["IDM_OB"]["price"])
-            return _Signal(self.symbol, "SELL", price, hi, "Breaker Block", t, "IDM OB broken -> retest")
-        if has_ext and _dir_from(ev, "BOS") == "bullish":
-            lo, hi = map(float, ev["EXT_OB"]["price"])
-            return _Signal(self.symbol, "BUY", price, lo, "Breaker Block", t, "EXT OB broken -> retest")
-        return None
-
-    def _fvg_cont(self) -> Optional[_Signal]:
-        ev = _extract_events(self.rt)
-        t = _last_time(self.rt)
-        price = _series_get(self.rt, "close", 0)
-        bull = _has_fvg(self.rt, True) and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish")
-        bear = _has_fvg(self.rt, False) and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish")
-        if bull:
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "FVG Continuation", t, "trend↑ + bullish FVG")
-        if bear:
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "FVG Continuation", t, "trend↓ + bearish FVG")
-        return None
-
-
-# ---------------------- محرّك التشغيل (باكتيست/حي) ----------------------
-@dataclass
-class _Config:
-    strategy: str
-    symbols: List[str]
-    start: dt.datetime
-    end: dt.datetime
-    equity: float = 100.0
-    risk_pct: float = 2.0
-    ny_offset: int = -4
-    live: bool = False
-    csv_map: Dict[str, str] | None = None
-
-
-class _Engine:
-    def __init__(self, cfg: _Config) -> None:
-        self.cfg = cfg
-        self.api = _IndicatorAPI.discover()
-        self.exchange = None
-        if ccxt is not None and (self.cfg.live or not self.cfg.csv_map):
-            try:
-                self.exchange = ccxt.binanceusdm({"enableRateLimit": True})
-            except Exception:
-                self.exchange = None
-
-    def _candles_for_symbol(self, sym: str) -> List[Dict[str, float]]:
-        if self.cfg.csv_map and sym in self.cfg.csv_map:
-            return _read_csv_series(self.cfg.csv_map[sym])
-        if self.exchange is None:
-            raise RuntimeError("الوضع المختار يتطلب ccxt أو CSV. وفّر CSV عبر --csv SYMBOL=path.csv")
-        return _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
-                                 since_ms=int(self.cfg.start.timestamp()*1000),
-                                 until_ms=int(self.cfg.end.timestamp()*1000))
-
-    def _run_series(self, sym: str, candles: List[Dict[str, float]]) -> None:
-        rt = self.api.new_runtime()
-        try:
-            rt.process([])  # تهيئة إن لزم
-        except Exception:
-            pass
-        eng = _StrategyEngine(rt, sym, equity=self.cfg.equity, risk_pct=self.cfg.risk_pct, ny_offset=self.cfg.ny_offset)
-        for c in candles:
-            try:
-                rt.process([c])
-            except Exception:
-                continue
-            eng.evaluate_and_print(self.cfg.strategy)
-
-    def run_backtest(self) -> None:
-        for sym in self.cfg.symbols:
-            candles = self._candles_for_symbol(sym)
-            if not candles:
-                print(f"[!] لا توجد شموع لرمز {sym}")
-                continue
-            self._run_series(sym, candles)
-
-    def run_live(self) -> None:
-        if self.exchange is None:
-            raise RuntimeError("الوضع الحي يتطلب ccxt واتصالاً بالمصدر")
-        while True:
-            now = dt.datetime.utcnow()
-            start = now - dt.timedelta(hours=24)
-            for sym in self.cfg.symbols:
-                candles = _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
-                                            since_ms=int(start.timestamp()*1000),
-                                            until_ms=int(now.timestamp()*1000))
-                self._run_series(sym, candles[-600:])  # آخر ~10 ساعات
-            time.sleep(10)
-
-
-# ---------------------- CLI وتشغيل تلقائي ----------------------
-def _parse_csv_map(arg: Optional[str]) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not arg:
-        return mapping
-    for part in arg.split(","):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            mapping[k.strip()] = v.strip()
-    return mapping
-
-
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ICT Strategy Runner (Integrated, text-only)")
-    p.add_argument("--strategy", default=DEFAULT_STRATEGY,
-                   choices=["ICT 2022","Silver Bullet","Judas Swing","Turtle Soup","OTE","PO3",
-                            "Liquidity Sweep + OB","Breaker Block","FVG Continuation","OSOK"],
-                   help="الاستراتيجية المفعلة")
-    p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="قائمة رموز مفصولة بفواصل (USDT-M)")
-    p.add_argument("--start", default=DEFAULT_START, help="YYYY-MM-DD")
-    p.add_argument("--end", default=DEFAULT_END, help="YYYY-MM-DD")
-    p.add_argument("--equity", type=float, default=DEFAULT_EQUITY, help="الرصيد بالدولار")
-    p.add_argument("--risk", type=float, default=DEFAULT_RISK, help="نسبة المخاطرة لكل صفقة (%)")
-    p.add_argument("--ny-offset", type=int, default=DEFAULT_NY_OFFSET, help="إزاحة نيويورك عن UTC (تقريبية)")
-    p.add_argument("--live", action="store_true", default=DEFAULT_LIVE, help="مسح حي (يتطلب ccxt)")
-    p.add_argument("--csv", default=DEFAULT_CSV, help="خرائط CSV: SYMBOL=path.csv[,SYMBOL2=path2.csv]")
-    args, _ = p.parse_known_args(argv)
-    return args
-
-
-def _main(argv: Optional[List[str]] = None) -> None:
-    args = _parse_args(argv)
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    start = dt.datetime.strptime(args.start, "%Y-%m-%d")
-    end = dt.datetime.strptime(args.end, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(milliseconds=1)
-    cfg = _Config(
-        strategy=args.strategy,
-        symbols=symbols,
-        start=start,
-        end=end,
-        equity=float(args.equity),
-        risk_pct=float(args.risk),
-        ny_offset=int(args.ny_offset),
-        live=bool(args.live),
-        csv_map=_parse_csv_map(args.csv),
-    )
-    eng = _Engine(cfg)
-    if cfg.live:
-        eng.run_live()
-    else:
-        eng.run_backtest()
+            while True:
+                _run_once()
+                if defaults.scan_interval:
+                    time.sleep(defaults.scan_interval)
+        else:
+            _run_once()
+    except KeyboardInterrupt:
+        print("تم إيقاف المسح.")
+
+
+def main() -> None:
+    _android_autorun()
 
 
 if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
-# ============================ End of Integration ============================
+    main()
