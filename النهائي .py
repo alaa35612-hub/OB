@@ -113,10 +113,11 @@ ANSI_HEADER_COLORS = [
 MAX_CHOCH_AGE_BARS = 120
 RETRACE_TOLERANCE = 0.0
 VERBOSE = False
+SHOW_PROGRESS = True
 
 
 @dataclass(frozen=True)
-class _EditorAutorunDefaults:
+class class_EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
@@ -134,7 +135,7 @@ class _EditorAutorunDefaults:
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 0.0
 
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
+EDITOR_AUTORUN_DEFAULTS = class_EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
     scan_interval=AUTORUN_SCAN_INTERVAL,
 )
@@ -157,7 +158,7 @@ class BinanceSymbolSelectorConfig:
     top_gainer_candle_window: Optional[int] = 10
 
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
-    prioritize_top_gainers=True
+    prioritize_top_gainers=False
 )
 
 
@@ -7448,6 +7449,7 @@ def evaluate_choch_retrace(
         "max_choch_age_bars": MAX_CHOCH_AGE_BARS,
         "retrace_tolerance": RETRACE_TOLERANCE,
         "verbose": VERBOSE,
+        "show_progress": SHOW_PROGRESS,
     }
     if params:
         cfg.update(params)
@@ -7462,8 +7464,13 @@ def evaluate_choch_retrace(
         min_index = max(0, last_index - int(cfg["max_choch_age_bars"]))
         min_time = series.time[min_index]
 
+    if cfg["show_progress"]:
+        print(f"[{symbol}] evaluating CHOCH retrace from indicator state...")
+
     choch = _find_latest_event(events, "choch", min_time=min_time)
     if not choch:
+        if cfg["show_progress"]:
+            print(f"[{symbol}] no recent CHOCH event found (indicator state).")
         return None
 
     direction = choch.get("direction")
@@ -7482,6 +7489,12 @@ def evaluate_choch_retrace(
         if getattr(runtime, "bxty", 0) == -1:
             zones.append(("Golden zone", _golden_zone_bounds(runtime)))
 
+    if cfg["show_progress"]:
+        zones_text = ", ".join(
+            f"{name}={bounds}" for name, bounds in zones if bounds is not None
+        )
+        print(f"[{symbol}] indicator zones: {zones_text or 'none'}")
+
     for zone_name, bounds in zones:
         if bounds and _touches_zone(high, low, bounds, cfg["retrace_tolerance"]):
             return ChoChAlert(
@@ -7491,7 +7504,8 @@ def evaluate_choch_retrace(
                 choch_time=choch.get("time", 0),
                 zone_bounds=bounds,
                 last_bar_time=last_time,
-                reason=f"CHOCH -> retrace to {zone_name}",
+                reason="CHOCH -> retrace to "
+                f"{zone_name} (indicator_state)",
             )
 
     return None
@@ -7503,18 +7517,40 @@ def scan_symbols(
     params: Optional[Dict[str, Any]] = None,
 ) -> List[ChoChAlert]:
     alerts: List[ChoChAlert] = []
+    cfg = {
+        "verbose": VERBOSE,
+        "show_progress": SHOW_PROGRESS,
+    }
+    if params:
+        cfg.update(params)
     for symbol, candles in symbols.items():
+        if cfg["show_progress"]:
+            print(f"[{symbol}] feeding {len(candles)} candles into indicator...")
         runtime = SmartMoneyAlgoProE5(base_timeframe="")
         runtime.process(candles)
         snapshot = runtime.snapshot_state()
+        if cfg["show_progress"]:
+            event_log = snapshot.get("event_log", [])
+            choch_events = sum(1 for evt in event_log if evt.get("name") == "choch")
+            fvg_up = getattr(runtime, "bullish_gap_holder", PineArray()).size()
+            fvg_down = getattr(runtime, "bearish_gap_holder", PineArray()).size()
+            ob_demand = getattr(runtime, "demandZone", PineArray()).size()
+            ob_supply = getattr(runtime, "supplyZone", PineArray()).size()
+            has_golden = getattr(runtime, "bxf", None) is not None
+            print(
+                f"[{symbol}] indicator state: CHOCH={choch_events} "
+                f"FVG(up={fvg_up}, down={fvg_down}) "
+                f"OB(demand={ob_demand}, supply={ob_supply}) "
+                f"GoldenZone={'yes' if has_golden else 'no'}"
+            )
         alert = evaluate_choch_retrace(symbol, runtime, snapshot, params=params)
         if alert:
             alerts.append(alert)
             print(
                 f"[ALERT] {alert.symbol} {alert.direction} CHOCH -> {alert.zone} "
-                f"@ {alert.zone_bounds} (CHOCH@{alert.choch_time})"
+                f"@ {alert.zone_bounds} (CHOCH@{alert.choch_time}, indicator_state)"
             )
-        elif params and params.get("verbose"):
+        elif cfg["verbose"]:
             print(f"[{symbol}] no match")
 
     print(f"FOUND {len(alerts)} ALERTS")
@@ -7532,6 +7568,8 @@ def _build_ccxt_exchange() -> Optional[Any]:
         print("CCXT غير مثبت. ثبت الحزمة ثم أعد التشغيل.")
         return None
     try:
+        if SHOW_PROGRESS:
+            print("Initializing CCXT Binance USDT-M client...")
         exchange = ccxt.binanceusdm(
             {
                 "enableRateLimit": True,
@@ -7579,6 +7617,8 @@ def _select_binance_usdtm_symbols(
         scored.sort(reverse=True)
         symbols = [symbol for _, symbol in scored]
 
+    if not max_symbols or max_symbols <= 0:
+        return symbols
     return symbols[:max_symbols]
 
 
@@ -7607,24 +7647,38 @@ def scan_binance_usdtm(
     recent_bars: int = 0,
     params: Optional[Dict[str, Any]] = None,
     selector: BinanceSymbolSelectorConfig = DEFAULT_BINANCE_SYMBOL_SELECTOR,
-) -> List[ICTMatch]:
-    """Fetch Binance USDT-M futures data via CCXT and run the ICT scanner."""
+) -> List[ChoChAlert]:
+    """Fetch Binance USDT-M futures data via CCXT and run the CHOCH scanner."""
+    cfg = {
+        "verbose": VERBOSE,
+        "show_progress": SHOW_PROGRESS,
+    }
+    if params:
+        cfg.update(params)
     exchange = _build_ccxt_exchange()
     if not exchange:
         return []
 
+    if cfg["show_progress"]:
+        print("Loading Binance USDT-M markets...")
+        print(
+            f"Using timeframe={timeframe} limit={limit} recent_bars={recent_bars} "
+            f"max_symbols={'ALL' if not max_symbols or max_symbols <= 0 else max_symbols}"
+        )
     symbols = _select_binance_usdtm_symbols(
         exchange, max_symbols=max_symbols, selector=selector
     )
     if not symbols:
         print("لا توجد رموز USDT-M صالحة للمسح.")
         return []
+    if cfg["show_progress"]:
+        print(f"Selected {len(symbols)} USDT-M symbols for scanning.")
 
     def _fetch_symbol(symbol: str) -> Tuple[str, List[Dict[str, float]]]:
         try:
             data = _fetch_ohlcv(exchange, symbol, timeframe, limit)
         except Exception as exc:  # pragma: no cover - network dependency
-            if params and params.get("verbose"):
+            if cfg["verbose"]:
                 print(f"[{symbol}] فشل جلب البيانات: {exc}")
             return symbol, []
         if recent_bars:
@@ -7639,9 +7693,11 @@ def scan_binance_usdtm(
             symbol, data = future.result()
             if data:
                 candles_by_symbol[symbol] = data
-            elif params and params.get("verbose"):
+            elif cfg["verbose"]:
                 print(f"[{symbol}] لا توجد بيانات كافية.")
 
+    if cfg["show_progress"]:
+        print(f"Fetched candles for {len(candles_by_symbol)} symbols.")
     return scan_symbols(candles_by_symbol, params=params)
 
 
@@ -7657,9 +7713,15 @@ def _android_autorun() -> None:
         "max_choch_age_bars": MAX_CHOCH_AGE_BARS,
         "retrace_tolerance": RETRACE_TOLERANCE,
         "verbose": VERBOSE,
+        "show_progress": SHOW_PROGRESS,
     }
 
     def _run_once() -> None:
+        if SHOW_PROGRESS:
+            print(
+                "Starting CHOCH retracement scan using indicator state "
+                "(Binance USDT-M futures)."
+            )
         scan_binance_usdtm(
             timeframe=defaults.timeframe,
             limit=defaults.candle_limit,
