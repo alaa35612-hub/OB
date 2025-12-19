@@ -108,14 +108,10 @@ ANSI_HEADER_COLORS = [
 
 
 # ----------------------------------------------------------------------------
-# Scanner parameters (ICT 2022 Model)
+# Scanner parameters (CHOCH retracement alerts)
 # ----------------------------------------------------------------------------
-SCAN_MODE = "SETUP"  # {"SETUP", "ENTRY"}
-ENTRY_MODE = "TOUCH"  # {"TOUCH", "MIDPOINT", "FULL_FILL"}
-MAX_SETUP_AGE_BARS = 100
-DISP_ATR_K = 1.5
-DISP_BODY_RATIO = 0.6
-FVG_MAX_AGE_BARS = 50
+MAX_CHOCH_AGE_BARS = 120
+RETRACE_TOLERANCE = 0.0
 VERBOSE = False
 
 
@@ -6443,6 +6439,14 @@ class SmartMoneyAlgoProE5:
                 self._register_structure_break_event("BOS", y, event_time, bullish=trend)
             elif name == "ChoCh":
                 self._register_structure_break_event("CHOCH", y, event_time, bullish=trend)
+                self._log_event(
+                    "choch",
+                    {
+                        "direction": "bullish" if trend else "bearish",
+                        "break_price": y,
+                        "time": event_time,
+                    },
+                )
         if name == "BOS" and self.inputs.structure.showSMC:
             ln = self.line_new(x, y, self.series.get_time(), y, "xloc.bar_time", color, "line.style_dashed")
             lbl = self.label_new(
@@ -7376,51 +7380,19 @@ class SmartMoneyAlgoProE5:
 
 
 # ----------------------------------------------------------------------------
-# ICT 2022 Scanner (state-driven, no alertcondition dependency)
+# CHOCH retracement scanner (state-driven)
 # ----------------------------------------------------------------------------
 
 
 @dataclass
-class ICTMatch:
+class ChoChAlert:
     symbol: str
     direction: str
-    mode: str
+    zone: str
+    choch_time: int
+    zone_bounds: Tuple[float, float]
     last_bar_time: int
-    sweep: Dict[str, Any]
-    mss: Dict[str, Any]
-    displacement: Dict[str, Any]
-    fvg: Dict[str, Any]
     reason: str
-
-
-def _bar_index_from_time(series: SeriesAccessor, time_val: int) -> Optional[int]:
-    for idx in range(len(series.time) - 1, -1, -1):
-        if series.time[idx] == time_val:
-            return idx
-    return None
-
-
-def _atr_at_index(series: SeriesAccessor, index: int, length: int = 14) -> float:
-    total = 0.0
-    count = 0
-    for i in range(index, max(index - length, 0), -1):
-        if i - 1 < 0:
-            break
-        high = series.high[i]
-        low = series.low[i]
-        prev_close = series.close[i - 1]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        total += tr
-        count += 1
-    return total / count if count else 0.0
-
-
-def _body_ratio(series: SeriesAccessor, index: int) -> float:
-    high = series.high[index]
-    low = series.low[index]
-    body = abs(series.close[index] - series.open[index])
-    candle_range = max(high - low, 1e-12)
-    return body / candle_range
 
 
 def _find_latest_event(
@@ -7428,7 +7400,6 @@ def _find_latest_event(
     name: str,
     *,
     direction: Optional[str] = None,
-    max_time: Optional[int] = None,
     min_time: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     for evt in reversed(events):
@@ -7437,27 +7408,45 @@ def _find_latest_event(
         if direction and evt.get("direction") != direction:
             continue
         time_val = evt.get("time") or evt.get("created_time")
-        if max_time is not None and time_val and time_val > max_time:
-            continue
         if min_time is not None and time_val and time_val < min_time:
             continue
         return evt
     return None
 
 
-def evaluate_ict2022(
+def _touches_zone(
+    high: float, low: float, bounds: Tuple[float, float], tolerance: float
+) -> bool:
+    lo, hi = bounds
+    tol = tolerance if tolerance > 0 else 0.0
+    return low <= hi + tol and high >= lo - tol
+
+
+def _latest_box_bounds(arr: PineArray) -> Optional[Tuple[float, float]]:
+    if arr.size() == 0:
+        return None
+    box_obj: Box = arr.get(arr.size() - 1)
+    top = box_obj.get_top()
+    bottom = box_obj.get_bottom()
+    return (min(bottom, top), max(bottom, top))
+
+
+def _golden_zone_bounds(runtime: SmartMoneyAlgoProE5) -> Optional[Tuple[float, float]]:
+    box_obj = getattr(runtime, "bxf", None)
+    if box_obj is None:
+        return None
+    return (min(box_obj.get_bottom(), box_obj.get_top()), max(box_obj.get_bottom(), box_obj.get_top()))
+
+
+def evaluate_choch_retrace(
     symbol: str,
     runtime: SmartMoneyAlgoProE5,
     snapshot: Dict[str, Any],
     params: Optional[Dict[str, Any]] = None,
-) -> Optional[ICTMatch]:
+) -> Optional[ChoChAlert]:
     cfg = {
-        "scan_mode": SCAN_MODE,
-        "entry_mode": ENTRY_MODE,
-        "max_setup_age_bars": MAX_SETUP_AGE_BARS,
-        "disp_atr_k": DISP_ATR_K,
-        "disp_body_ratio": DISP_BODY_RATIO,
-        "fvg_max_age_bars": FVG_MAX_AGE_BARS,
+        "max_choch_age_bars": MAX_CHOCH_AGE_BARS,
+        "retrace_tolerance": RETRACE_TOLERANCE,
         "verbose": VERBOSE,
     }
     if params:
@@ -7468,129 +7457,74 @@ def evaluate_ict2022(
     last_time = series.get_time()
     events = snapshot.get("event_log", [])
 
-    max_age_time = None
+    min_time = None
     if last_index >= 0:
-        min_index = max(0, last_index - int(cfg["max_setup_age_bars"]))
-        max_age_time = series.time[min_index]
+        min_index = max(0, last_index - int(cfg["max_choch_age_bars"]))
+        min_time = series.time[min_index]
 
-    sweep = _find_latest_event(
-        events,
-        "liquidity_sweep",
-        min_time=max_age_time,
-    )
-    if not sweep:
+    choch = _find_latest_event(events, "choch", min_time=min_time)
+    if not choch:
         return None
 
-    sweep_time = sweep.get("time")
-    sweep_idx = _bar_index_from_time(series, sweep_time) if sweep_time else None
-    if sweep_idx is None:
-        return None
+    direction = choch.get("direction")
+    high = series.get("high")
+    low = series.get("low")
 
-    direction = sweep.get("direction")
-    mss = _find_latest_event(
-        events,
-        "mss",
-        direction=direction,
-        min_time=sweep_time,
-    )
-    if not mss:
-        return None
+    zones: List[Tuple[str, Optional[Tuple[float, float]]]] = []
+    if direction == "bullish":
+        zones.append(("OB", _latest_box_bounds(getattr(runtime, "demandZone", PineArray()))))
+        zones.append(("FVG", _latest_box_bounds(getattr(runtime, "bullish_gap_holder", PineArray()))))
+        if getattr(runtime, "bxty", 0) == 1:
+            zones.append(("Golden zone", _golden_zone_bounds(runtime)))
+    else:
+        zones.append(("OB", _latest_box_bounds(getattr(runtime, "supplyZone", PineArray()))))
+        zones.append(("FVG", _latest_box_bounds(getattr(runtime, "bearish_gap_holder", PineArray()))))
+        if getattr(runtime, "bxty", 0) == -1:
+            zones.append(("Golden zone", _golden_zone_bounds(runtime)))
 
-    mss_time = mss.get("time")
-    mss_idx = _bar_index_from_time(series, mss_time) if mss_time else None
-    if mss_idx is None or mss_idx < sweep_idx:
-        return None
+    for zone_name, bounds in zones:
+        if bounds and _touches_zone(high, low, bounds, cfg["retrace_tolerance"]):
+            return ChoChAlert(
+                symbol=symbol,
+                direction=direction,
+                zone=zone_name,
+                choch_time=choch.get("time", 0),
+                zone_bounds=bounds,
+                last_bar_time=last_time,
+                reason=f"CHOCH -> retrace to {zone_name}",
+            )
 
-    disp_event = None
-    for idx in range(mss_idx, last_index + 1):
-        atr = _atr_at_index(series, idx)
-        body = abs(series.close[idx] - series.open[idx])
-        ratio = _body_ratio(series, idx)
-        if (atr and body >= cfg["disp_atr_k"] * atr) or ratio >= cfg["disp_body_ratio"]:
-            disp_event = {
-                "disp_time": series.time[idx],
-                "disp_range": series.high[idx] - series.low[idx],
-                "disp_atr_ratio": body / atr if atr else 0.0,
-                "index": idx,
-            }
-            break
-    if not disp_event:
-        return None
-
-    disp_time = disp_event["disp_time"]
-    fvg = _find_latest_event(
-        events,
-        "fvg_created",
-        direction=direction,
-        min_time=disp_time,
-    )
-    if not fvg:
-        return None
-
-    fvg_time = fvg.get("created_time")
-    fvg_idx = _bar_index_from_time(series, fvg_time) if fvg_time else None
-    if fvg_idx is None or (last_index - fvg_idx) > cfg["fvg_max_age_bars"]:
-        return None
-
-    fvg_low = float(fvg["fvg_low"])
-    fvg_high = float(fvg["fvg_high"])
-    if cfg["scan_mode"].upper() == "ENTRY":
-        current_high = series.get("high")
-        current_low = series.get("low")
-        current_close = series.get("close")
-        midpoint = (fvg_low + fvg_high) / 2.0
-        touched = False
-        if cfg["entry_mode"] == "TOUCH":
-            touched = current_low <= fvg_high and current_high >= fvg_low
-        elif cfg["entry_mode"] == "MIDPOINT":
-            touched = current_low <= midpoint <= current_high
-        elif cfg["entry_mode"] == "FULL_FILL":
-            touched = fvg_low <= current_close <= fvg_high
-        if not touched:
-            return None
-
-    reason = "sweep -> mss -> displacement -> fvg"
-    return ICTMatch(
-        symbol=symbol,
-        direction=direction,
-        mode=cfg["scan_mode"],
-        last_bar_time=last_time,
-        sweep=sweep,
-        mss=mss,
-        displacement=disp_event,
-        fvg=fvg,
-        reason=reason,
-    )
+    return None
 
 
 def scan_symbols(
     symbols: Dict[str, List[Dict[str, float]]],
     *,
     params: Optional[Dict[str, Any]] = None,
-) -> List[ICTMatch]:
-    matches: List[ICTMatch] = []
+) -> List[ChoChAlert]:
+    alerts: List[ChoChAlert] = []
     for symbol, candles in symbols.items():
         runtime = SmartMoneyAlgoProE5(base_timeframe="")
         runtime.process(candles)
         snapshot = runtime.snapshot_state()
-        match = evaluate_ict2022(symbol, runtime, snapshot, params=params)
-        if match:
-            matches.append(match)
+        alert = evaluate_choch_retrace(symbol, runtime, snapshot, params=params)
+        if alert:
+            alerts.append(alert)
+            print(
+                f"[ALERT] {alert.symbol} {alert.direction} CHOCH -> {alert.zone} "
+                f"@ {alert.zone_bounds} (CHOCH@{alert.choch_time})"
+            )
         elif params and params.get("verbose"):
             print(f"[{symbol}] no match")
 
-    print(f"FOUND {len(matches)} MATCHES")
-    for match in matches:
-        sweep_time = match.sweep.get("time")
-        mss_time = match.mss.get("time")
-        fvg_low = match.fvg.get("fvg_low")
-        fvg_high = match.fvg.get("fvg_high")
+    print(f"FOUND {len(alerts)} ALERTS")
+    for alert in alerts:
         print(
-            f"{match.symbol} | {match.direction} | {match.mode} | "
-            f"SWEEP@{sweep_time} | MSS@{mss_time} | FVG[{fvg_low}-{fvg_high}] | "
-            f"LAST_BAR_TIME {match.last_bar_time}"
+            f"{alert.symbol} | {alert.direction} | {alert.zone} | "
+            f"CHOCH@{alert.choch_time} | ZONE[{alert.zone_bounds[0]}-{alert.zone_bounds[1]}] | "
+            f"LAST_BAR_TIME {alert.last_bar_time}"
         )
-    return matches
+    return alerts
 
 
 def _build_ccxt_exchange() -> Optional[Any]:
@@ -7720,12 +7654,8 @@ def _android_autorun() -> None:
         return
 
     params = {
-        "scan_mode": SCAN_MODE,
-        "entry_mode": ENTRY_MODE,
-        "max_setup_age_bars": MAX_SETUP_AGE_BARS,
-        "disp_atr_k": DISP_ATR_K,
-        "disp_body_ratio": DISP_BODY_RATIO,
-        "fvg_max_age_bars": FVG_MAX_AGE_BARS,
+        "max_choch_age_bars": MAX_CHOCH_AGE_BARS,
+        "retrace_tolerance": RETRACE_TOLERANCE,
         "verbose": VERBOSE,
     }
 
