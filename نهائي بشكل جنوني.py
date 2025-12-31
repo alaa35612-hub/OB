@@ -128,12 +128,13 @@ def _warn_missing_deps(*, live_required: bool = False) -> bool:
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
-    max_symbols: int = 600
-    recent_bars: int = 2
-    concurrency: int = 1
+    max_symbols: int = 500
+    recent_bars: int = 1
+    concurrency: int = 4
     fast_scan: bool = True
     continuous_scan: bool = False
     scan_interval: float = 0.0
+    rate_limit_sleep: float = 0.08
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
     height_threshold: Optional[float] = None
@@ -144,8 +145,9 @@ class _EditorAutorunDefaults:
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 2.0
-AUTORUN_CONCURRENCY = 1
+AUTORUN_CONCURRENCY = 4
 AUTORUN_FAST_SCAN = True
+AUTORUN_RATE_LIMIT_SLEEP = 0.08
 # فلتر ارتفاع العملات خلال 24 ساعة (٪) - عدّل النسبة لتخصيص الفلتر
 AUTORUN_MIN_DAILY_CHANGE = 10.0
 
@@ -154,6 +156,7 @@ EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     scan_interval=AUTORUN_SCAN_INTERVAL,
     concurrency=AUTORUN_CONCURRENCY,
     fast_scan=AUTORUN_FAST_SCAN,
+    rate_limit_sleep=AUTORUN_RATE_LIMIT_SLEEP,
     height_threshold=AUTORUN_MIN_DAILY_CHANGE,
 )
 
@@ -7813,6 +7816,11 @@ class _GlobalRateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
 
+    def set_interval(self, min_interval: float) -> None:
+        with self._lock:
+            self._min_interval = max(0.0, float(min_interval))
+            self._next_allowed = 0.0
+
     def wait(self) -> None:
         if self._min_interval <= 0:
             return
@@ -7823,7 +7831,7 @@ class _GlobalRateLimiter:
             self._next_allowed = time.time() + self._min_interval
 
 
-GLOBAL_RATE_LIMITER = _GlobalRateLimiter()
+GLOBAL_RATE_LIMITER = _GlobalRateLimiter(EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep)
 
 
 def _call_with_retries(action: Callable[[], Any], *, retries: int = 3) -> Any:
@@ -8927,10 +8935,12 @@ def scan_binance(
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
     fast_scan: bool = True,
+    rate_limit_sleep: float = EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    GLOBAL_RATE_LIMITER.set_interval(rate_limit_sleep)
     _ensure_markets_loaded(exchange)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
@@ -8988,7 +8998,7 @@ def scan_binance(
             ticker = tickers.get(symbol)
             if ticker is None and (min_daily_change > 0.0 or ticker_error is not None):
                 try:
-                    ticker = _get_exchange().fetch_ticker(symbol)
+                    ticker = _call_with_retries(lambda: _get_exchange().fetch_ticker(symbol), retries=3)
                 except Exception as exc:
                     print(
                         f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
@@ -9061,10 +9071,29 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    effective_concurrency = 1
-    if concurrency > 1:
-        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    try:
+        effective_concurrency = max(1, int(concurrency))
+    except (TypeError, ValueError):
+        effective_concurrency = 1
+    max_safe_workers = 8
+    if effective_concurrency > max_safe_workers:
+        print(
+            f"تم تقليص التوازي إلى {max_safe_workers} لتجنّب حظر REST من Binance.",
+            flush=True,
+        )
+        effective_concurrency = max_safe_workers
+    if effective_concurrency > 1:
+        print(f"تشغيل المسح بتوازي {effective_concurrency} مع حماية معدل الطلبات.", flush=True)
+
+    if effective_concurrency > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+            futures = [
+                executor.submit(scan_symbol, idx, symbol)
+                for idx, symbol in enumerate(all_symbols)
+            ]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+    else:
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
@@ -9095,6 +9124,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--symbols", type=str, default="")
     parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
     parser.add_argument(
+        "--rate-limit-sleep",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
+        help="فاصل زمني (ثوانٍ) بين طلبات Binance لتقليل الحظر أثناء التوازي",
+    )
+    parser.add_argument(
         "--min-daily-change",
         type=float,
         default=0.0,
@@ -9118,8 +9153,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
-        help="Ignore console events older than this many completed bars (minimum 1)",
+        default=0,
+        help="Ignore console events older than this many completed bars (0 = current bar only)",
     )
     parser.add_argument(
         "--continuous",
@@ -9158,10 +9193,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars <= 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
+    if args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.rate_limit_sleep < 0.0:
+        parser.error("--rate-limit-sleep يجب أن يكون رقمًا غير سالب")
     if args.continuous_scan and args.scan_interval <= 0.0:
         args.scan_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
@@ -9257,6 +9294,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
                 fast_scan=args.fast_scan,
+                rate_limit_sleep=args.rate_limit_sleep,
             )
             perform_comparison()
             log("Rendering")
@@ -9384,7 +9422,7 @@ class _CLISettings:
     market: str = "usdtm"         # {usdtm, spot}
     min_change: Optional[float] = None       # ≥ %
     min_volume: Optional[float] = None  # ≥ USDT
-    max_scan: int = 60            # after filtering & sorting
+    max_scan: int = 500            # after filtering & sorting
     allow_meme: bool = False
     exclude_symbols: str = ""
     exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
@@ -9478,7 +9516,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
     # market / selection
     p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
+    p.add_argument("--max-symbols", "-n", type=int, default=500)
     # timeframe/limit
     p.add_argument("--timeframe", "-t", default="1m")
     p.add_argument("--limit", "-l", type=int, default=800)
@@ -9508,13 +9546,13 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     # filters
     p.add_argument("--min-change", type=float, default=None)
     p.add_argument("--min-volume", type=float, default=None)
-    p.add_argument("--max-scan", type=int, default=60)
+    p.add_argument("--max-scan", type=int, default=500)
     p.add_argument("--allow-meme", action="store_true", default=False)
     p.add_argument("--exclude-symbols", default="")
     p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
     p.add_argument("--include-only", default="")
     # misc
-    p.add_argument("--recent", type=int, default=2)
+    p.add_argument("--recent", type=int, default=1)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
@@ -9948,7 +9986,7 @@ def __editor_autoargs__():
             "-t", "1m", "-l", "600",
             "--min-change", "5",
             "--min-volume", "30000000",
-            "--max-scan", "60",
+            "--max-scan", "500",
             "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
             "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
             "--verbose"
@@ -10260,6 +10298,7 @@ class Settings:
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
         self.fast_scan = kw.get("fast_scan", EDITOR_AUTORUN_DEFAULTS.fast_scan)
+        self.rate_limit_sleep = kw.get("rate_limit_sleep", EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep)
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10318,6 +10357,12 @@ def _parse_args_android():
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     p.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
+    p.add_argument(
+        "--rate-limit-sleep",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
+        help="فاصل زمني (ثوانٍ) بين طلبات Binance لتقليل الحظر أثناء التوازي",
+    )
     p.add_argument(
         "--fast-scan",
         dest="fast_scan",
@@ -10431,6 +10476,8 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.concurrency <= 0:
         p.error("--concurrency يجب أن يكون رقمًا موجبًا")
+    if args.rate_limit_sleep < 0.0:
+        p.error("--rate-limit-sleep يجب أن يكون رقمًا غير سالب")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10497,6 +10544,7 @@ def _parse_args_android():
         concurrency=args.concurrency,
         min_change=args.min_change,
         fast_scan=args.fast_scan,
+        rate_limit_sleep=args.rate_limit_sleep,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
         height_metric=height_metric,
@@ -10585,6 +10633,7 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    GLOBAL_RATE_LIMITER.set_interval(cfg.rate_limit_sleep)
     print("بدء تشغيل ماسح Binance (وضع المحرر)...", flush=True)
     markets_ready = _ensure_markets_loaded(ex)
     if markets_ready:
@@ -10744,9 +10793,27 @@ def _android_cli_entry() -> int:
                         pass
                 return i, sym, runtime, recent_alerts, recent_hits, None
 
-            if cfg.concurrency > 1:
-                print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-            results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
+            try:
+                effective_concurrency = max(1, int(cfg.concurrency))
+            except (TypeError, ValueError):
+                effective_concurrency = 1
+            max_safe_workers = 8
+            if effective_concurrency > max_safe_workers:
+                print(
+                    f"تم تقليص التوازي إلى {max_safe_workers} لتجنّب حظر REST من Binance.",
+                    flush=True,
+                )
+                effective_concurrency = max_safe_workers
+            if effective_concurrency > 1:
+                print(f"تشغيل المسح بتوازي {effective_concurrency} مع حماية معدل الطلبات.", flush=True)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+                    futures = [
+                        executor.submit(scan_symbol, i, sym)
+                        for i, sym in enumerate(symbols, 1)
+                    ]
+                    results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            else:
+                results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
 
             results.sort(key=lambda item: item[0])
             for i, sym, runtime, recent_alerts, recent_hits, err in results:
@@ -10807,6 +10874,8 @@ def __router_main__():
             "--recent", str(defaults.recent_bars),
             "--verbose",
         ]
+        if defaults.rate_limit_sleep >= 0:
+            sys.argv += ["--rate-limit-sleep", str(defaults.rate_limit_sleep)]
         if defaults.height_threshold is not None:
             sys.argv += ["--min-change", str(defaults.height_threshold)]
         if defaults.height_candle_window is not None:
