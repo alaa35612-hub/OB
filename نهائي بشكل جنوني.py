@@ -30,6 +30,7 @@ import inspect
 import json
 import math
 import os
+import random
 import re
 import sys
 import textwrap
@@ -40,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+import websocket
 try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -124,16 +126,22 @@ def _warn_missing_deps(*, live_required: bool = False) -> bool:
     return True
 
 
+def _print_build_id() -> None:
+    print(f"[BUILD_ID] {BUILD_ID}", flush=True)
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
-    max_symbols: int = 600
-    recent_bars: int = 2
-    concurrency: int = 1
+    max_symbols: int = 500
+    recent_bars: int = 1
+    concurrency: int = 4
     fast_scan: bool = True
+    pipeline: bool = True
     continuous_scan: bool = False
     scan_interval: float = 0.0
+    rate_limit_sleep: float = 0.08
     height_metric: str = "percentage"
     height_scope: Optional[str] = None
     height_threshold: Optional[float] = None
@@ -144,8 +152,10 @@ class _EditorAutorunDefaults:
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 2.0
-AUTORUN_CONCURRENCY = 1
+AUTORUN_CONCURRENCY = 4
 AUTORUN_FAST_SCAN = True
+AUTORUN_PIPELINE = True
+AUTORUN_RATE_LIMIT_SLEEP = 0.08
 # فلتر ارتفاع العملات خلال 24 ساعة (٪) - عدّل النسبة لتخصيص الفلتر
 AUTORUN_MIN_DAILY_CHANGE = 10.0
 
@@ -154,8 +164,29 @@ EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     scan_interval=AUTORUN_SCAN_INTERVAL,
     concurrency=AUTORUN_CONCURRENCY,
     fast_scan=AUTORUN_FAST_SCAN,
+    pipeline=AUTORUN_PIPELINE,
+    rate_limit_sleep=AUTORUN_RATE_LIMIT_SLEEP,
     height_threshold=AUTORUN_MIN_DAILY_CHANGE,
 )
+
+BUILD_ID = "SMC_PIPELINE_BUILD_2025_02_20"
+
+# إعدادات وضع الـ Pipeline (قابلة للتعديل)
+TOP_N = 10
+INITIAL = 150
+ROTATE_BATCH = 75
+DISCOVERY_EVERY_SEC = 12.0
+LIVE_LOOP_SEC = 0.2
+MIN_ALERT_SCORE = 1.0
+ALERT_TOP_N = 5
+ALERT_FLUSH_SEC = 1.5
+REST_CALLS_PER_MIN = 600
+REST_CONCURRENCY = 3
+ALERT_COOLDOWN_SEC = 120
+ZONE_COOLDOWN_SEC = 300
+CONFIRM_TOUCH = True
+ALERTS_JSONL_PATH = "alerts.jsonl"
+ALERT_STATE_PATH = "scanner_state.json"
 
 
 @dataclass(frozen=True)
@@ -7572,7 +7603,7 @@ def _binance_pick_symbols(
         return BinanceSymbolSelection([], [], False, False)
 
     try:
-        tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
+        tickers = _fetch_tickers_cached(exchange, None, ttl=3.0)
     except Exception as exc:
         print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
         tickers = {}
@@ -7636,7 +7667,7 @@ def _binance_pick_symbols(
             f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
             flush=True,
         )
-        candles_map = _bulk_fetch_recent_ohlcv(
+        candles_map = _bulk_ohlcv_cached(
             exchange,
             [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
             scope,
@@ -7813,6 +7844,11 @@ class _GlobalRateLimiter:
         self._lock = threading.Lock()
         self._next_allowed = 0.0
 
+    def set_interval(self, min_interval: float) -> None:
+        with self._lock:
+            self._min_interval = max(0.0, float(min_interval))
+            self._next_allowed = 0.0
+
     def wait(self) -> None:
         if self._min_interval <= 0:
             return
@@ -7823,7 +7859,42 @@ class _GlobalRateLimiter:
             self._next_allowed = time.time() + self._min_interval
 
 
-GLOBAL_RATE_LIMITER = _GlobalRateLimiter()
+GLOBAL_RATE_LIMITER = _GlobalRateLimiter(EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep)
+
+_TICKER_CACHE: Dict[str, Any] = {"ts": 0.0, "key": None, "data": {}}
+_BULK_OHLCV_CACHE: Dict[str, Any] = {"ts": 0.0, "key": None, "data": {}}
+
+
+def _fetch_tickers_cached(
+    exchange: Any,
+    symbols: Optional[Sequence[str]],
+    *,
+    ttl: float = 2.0,
+) -> Dict[str, Any]:
+    key = tuple(symbols) if symbols else None
+    now = time.time()
+    if _TICKER_CACHE["key"] == key and now - _TICKER_CACHE["ts"] <= ttl:
+        return _TICKER_CACHE["data"]
+    data = _call_with_retries(lambda: exchange.fetch_tickers(symbols), retries=3)
+    _TICKER_CACHE.update({"ts": now, "key": key, "data": data})
+    return data
+
+
+def _bulk_ohlcv_cached(
+    exchange: Any,
+    symbols: Sequence[str],
+    timeframe: str,
+    candle_window: int,
+    *,
+    ttl: float = 5.0,
+) -> Dict[str, Sequence[Sequence[Any]]]:
+    key = (tuple(symbols), timeframe, candle_window)
+    now = time.time()
+    if _BULK_OHLCV_CACHE["key"] == key and now - _BULK_OHLCV_CACHE["ts"] <= ttl:
+        return _BULK_OHLCV_CACHE["data"]
+    data = _bulk_fetch_recent_ohlcv(exchange, symbols, timeframe, candle_window)
+    _BULK_OHLCV_CACHE.update({"ts": now, "key": key, "data": data})
+    return data
 
 
 def _call_with_retries(action: Callable[[], Any], *, retries: int = 3) -> Any:
@@ -8927,10 +8998,12 @@ def scan_binance(
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
     fast_scan: bool = True,
+    rate_limit_sleep: float = EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    GLOBAL_RATE_LIMITER.set_interval(rate_limit_sleep)
     _ensure_markets_loaded(exchange)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
@@ -8957,12 +9030,9 @@ def scan_binance(
     ticker_error: Optional[Exception] = None
     try:
         if all_symbols:
-            tickers = _call_with_retries(
-                lambda: exchange.fetch_tickers(all_symbols),
-                retries=3,
-            )
+            tickers = _fetch_tickers_cached(exchange, all_symbols, ttl=2.0)
         else:
-            tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
+            tickers = _fetch_tickers_cached(exchange, None, ttl=2.0)
     except Exception as exc:
         try:
             tickers = _call_with_retries(exchange.fetch_tickers, retries=3)
@@ -8988,7 +9058,7 @@ def scan_binance(
             ticker = tickers.get(symbol)
             if ticker is None and (min_daily_change > 0.0 or ticker_error is not None):
                 try:
-                    ticker = _get_exchange().fetch_ticker(symbol)
+                    ticker = _call_with_retries(lambda: _get_exchange().fetch_ticker(symbol), retries=3)
                 except Exception as exc:
                     print(
                         f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
@@ -9061,10 +9131,29 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    effective_concurrency = 1
-    if concurrency > 1:
-        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    try:
+        effective_concurrency = max(1, int(concurrency))
+    except (TypeError, ValueError):
+        effective_concurrency = 1
+    max_safe_workers = 8
+    if effective_concurrency > max_safe_workers:
+        print(
+            f"تم تقليص التوازي إلى {max_safe_workers} لتجنّب حظر REST من Binance.",
+            flush=True,
+        )
+        effective_concurrency = max_safe_workers
+    if effective_concurrency > 1:
+        print(f"تشغيل المسح بتوازي {effective_concurrency} مع حماية معدل الطلبات.", flush=True)
+
+    if effective_concurrency > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+            futures = [
+                executor.submit(scan_symbol, idx, symbol)
+                for idx, symbol in enumerate(all_symbols)
+            ]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+    else:
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
@@ -9080,6 +9169,7 @@ def scan_binance(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    _print_build_id()
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
@@ -9094,6 +9184,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
     parser.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
+    parser.add_argument(
+        "--rate-limit-sleep",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
+        help="فاصل زمني (ثوانٍ) بين طلبات Binance لتقليل الحظر أثناء التوازي",
+    )
     parser.add_argument(
         "--min-daily-change",
         type=float,
@@ -9118,8 +9214,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
-        help="Ignore console events older than this many completed bars (minimum 1)",
+        default=0,
+        help="Ignore console events older than this many completed bars (0 = current bar only)",
     )
     parser.add_argument(
         "--continuous",
@@ -9158,10 +9254,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars <= 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
+    if args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.rate_limit_sleep < 0.0:
+        parser.error("--rate-limit-sleep يجب أن يكون رقمًا غير سالب")
     if args.continuous_scan and args.scan_interval <= 0.0:
         args.scan_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
@@ -9257,6 +9355,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
                 fast_scan=args.fast_scan,
+                rate_limit_sleep=args.rate_limit_sleep,
             )
             perform_comparison()
             log("Rendering")
@@ -9384,7 +9483,7 @@ class _CLISettings:
     market: str = "usdtm"         # {usdtm, spot}
     min_change: Optional[float] = None       # ≥ %
     min_volume: Optional[float] = None  # ≥ USDT
-    max_scan: int = 60            # after filtering & sorting
+    max_scan: int = 500            # after filtering & sorting
     allow_meme: bool = False
     exclude_symbols: str = ""
     exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
@@ -9435,7 +9534,7 @@ def _pick_symbols(
     else:
         universe = [s for s, m in markets.items() if m.get("spot") and m.get("quote") == "USDT"]
     try:
-        ticks = _call_with_retries(lambda: ex.fetch_tickers(universe), retries=3)
+        ticks = _fetch_tickers_cached(ex, universe, ttl=2.0)
     except Exception:
         # fallback: greedy highest-volume
         universe_sorted = sorted(universe)[:min(max_symbols_hint, cfg.max_scan)]
@@ -9478,7 +9577,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
     # market / selection
     p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
+    p.add_argument("--max-symbols", "-n", type=int, default=500)
     # timeframe/limit
     p.add_argument("--timeframe", "-t", default="1m")
     p.add_argument("--limit", "-l", type=int, default=800)
@@ -9508,13 +9607,13 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     # filters
     p.add_argument("--min-change", type=float, default=None)
     p.add_argument("--min-volume", type=float, default=None)
-    p.add_argument("--max-scan", type=int, default=60)
+    p.add_argument("--max-scan", type=int, default=500)
     p.add_argument("--allow-meme", action="store_true", default=False)
     p.add_argument("--exclude-symbols", default="")
     p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
     p.add_argument("--include-only", default="")
     # misc
-    p.add_argument("--recent", type=int, default=2)
+    p.add_argument("--recent", type=int, default=1)
     p.add_argument("--verbose", "-v", action="store_true", default=False)
     p.add_argument("--debug", action="store_true", default=False)
     p.add_argument("--tg", action="store_true", default=False)
@@ -9555,7 +9654,7 @@ def _should_route_android(argv: List[str]) -> bool:
         "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
         "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
         "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
+        "--recent","--verbose","-v","--debug","--tg","--pipeline"
     }
     return any(a in knobs for a in argv)
 
@@ -9948,7 +10047,7 @@ def __editor_autoargs__():
             "-t", "1m", "-l", "600",
             "--min-change", "5",
             "--min-volume", "30000000",
-            "--max-scan", "60",
+            "--max-scan", "500",
             "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
             "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
             "--verbose"
@@ -10260,6 +10359,8 @@ class Settings:
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
         self.fast_scan = kw.get("fast_scan", EDITOR_AUTORUN_DEFAULTS.fast_scan)
+        self.rate_limit_sleep = kw.get("rate_limit_sleep", EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep)
+        self.pipeline = bool(kw.get("pipeline", False))
         raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
             self.min_change = float(raw_threshold) if raw_threshold is not None else None
@@ -10311,6 +10412,506 @@ class Settings:
         if self.continuous_scan and self.continuous_interval <= 0.0:
             self.continuous_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
+
+class _RestGuard:
+    def __init__(self, calls_per_min: float, concurrency: int) -> None:
+        interval = 0.0
+        if calls_per_min and calls_per_min > 0:
+            interval = 60.0 / float(calls_per_min)
+        self._limiter = _GlobalRateLimiter(interval)
+        self._semaphore = threading.Semaphore(max(1, int(concurrency)))
+
+    def call(self, action: Callable[[], Any], *, retries: int = 3) -> Any:
+        last_exc: Optional[Exception] = None
+        for attempt in range(retries):
+            try:
+                with self._semaphore:
+                    self._limiter.wait()
+                    return action()
+            except Exception as exc:
+                last_exc = exc
+                if not _is_rate_limit_error(exc):
+                    raise
+                ban_until = _extract_ban_until_ms(str(exc))
+                if ban_until:
+                    _sleep_until(ban_until)
+                else:
+                    time.sleep(_rate_limit_backoff(attempt + 1) + random.uniform(0.0, 0.5))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("request failed without exception")
+
+
+class _OHLCVCache:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Tuple[float, List[List[float]]]] = {}
+
+    def get(
+        self,
+        key: str,
+        *,
+        ttl: float,
+        fetcher: Callable[[], List[List[float]]],
+        force: bool = False,
+    ) -> List[List[float]]:
+        now = time.time()
+        with self._lock:
+            if not force:
+                cached = self._cache.get(key)
+                if cached:
+                    ts, data = cached
+                    if now - ts <= ttl:
+                        return data
+        data = fetcher()
+        with self._lock:
+            self._cache[key] = (now, data)
+        return data
+
+
+class _AlertState:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.symbol_cooldown: Dict[str, float] = {}
+        self.zone_cooldown: Dict[str, float] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            payload = json.loads(Path(self.path).read_text(encoding="utf-8"))
+        except Exception:
+            return
+        self.symbol_cooldown = {k: float(v) for k, v in payload.get("symbols", {}).items()}
+        self.zone_cooldown = {k: float(v) for k, v in payload.get("zones", {}).items()}
+
+    def save(self) -> None:
+        payload = {"symbols": self.symbol_cooldown, "zones": self.zone_cooldown}
+        try:
+            Path(self.path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def allow(self, symbol: str, zone_id: str, now: float) -> bool:
+        last_sym = self.symbol_cooldown.get(symbol, 0.0)
+        last_zone = self.zone_cooldown.get(zone_id, 0.0)
+        if now - last_sym < ALERT_COOLDOWN_SEC:
+            return False
+        if now - last_zone < ZONE_COOLDOWN_SEC:
+            return False
+        return True
+
+    def mark(self, symbol: str, zone_id: str, now: float) -> None:
+        self.symbol_cooldown[symbol] = now
+        self.zone_cooldown[zone_id] = now
+        self.save()
+
+
+class _AlertAggregator:
+    def __init__(self, *, flush_sec: float, top_n: int) -> None:
+        self.flush_sec = max(0.1, float(flush_sec))
+        self.top_n = max(1, int(top_n))
+        self.last_flush = time.time()
+        self.items: List[Dict[str, Any]] = []
+
+    def add(self, item: Dict[str, Any]) -> None:
+        self.items.append(item)
+
+    def should_flush(self) -> bool:
+        return (time.time() - self.last_flush) >= self.flush_sec
+
+    def flush(self, *, cfg: Settings) -> None:
+        if not self.items:
+            self.last_flush = time.time()
+            return
+        self.items.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        batch = self.items[: self.top_n]
+        lines = []
+        for item in batch:
+            line = (
+                f"[{item.get('symbol')}] {item.get('direction')} | السعر {item.get('price'):.6f} | "
+                f"{item.get('zone_text')} | score={item.get('score'):.2f}"
+            )
+            lines.append(line)
+        print("\n".join(lines), flush=True)
+        _send_tg(cfg, lines)
+        self.items.clear()
+        self.last_flush = time.time()
+
+
+class _WSPriceFeed:
+    def __init__(self, *, url: str) -> None:
+        self.url = url
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self.prices: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            ws = websocket.WebSocketApp(
+                self.url,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+            time.sleep(1.0)
+
+    def _on_message(self, ws, message: str) -> None:
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return
+        if isinstance(payload, list):
+            data = payload
+        elif isinstance(payload, dict):
+            data = payload.get("data", payload)
+        else:
+            return
+        if not isinstance(data, list):
+            return
+        with self._lock:
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                sym = entry.get("s") or entry.get("symbol")
+                price = entry.get("c") or entry.get("lastPrice")
+                if not sym or price is None:
+                    continue
+                try:
+                    price_value = float(price)
+                except (TypeError, ValueError):
+                    continue
+                canonical = _binance_linear_symbol_from_id(sym) or sym
+                self.prices[canonical] = price_value
+                self.prices[sym] = price_value
+
+    def _on_error(self, ws, error: Exception) -> None:
+        print(f"WS error: {error}", flush=True)
+
+    def _on_close(self, ws, code, reason) -> None:
+        print("WS closed, reconnecting...", flush=True)
+
+    def get_price(self, symbol: str) -> Optional[float]:
+        with self._lock:
+            return self.prices.get(symbol) or self.prices.get(_binance_linear_symbol_id(symbol) or "")
+
+
+def _build_zone_id(symbol: str, zone: Box, direction: str) -> str:
+    return f"{symbol}:{direction}:{zone.left}:{zone.right}:{zone.top:.6f}:{zone.bottom:.6f}:{zone.text}"
+
+
+def _extract_zones_from_runtime(runtime: Any, symbol: str) -> List[Dict[str, Any]]:
+    zones: List[Dict[str, Any]] = []
+    demand = getattr(runtime, "demandZone", None)
+    supply = getattr(runtime, "supplyZone", None)
+    if demand is not None and hasattr(demand, "size"):
+        for i in range(demand.size()):
+            box = demand.get(i)
+            if not isinstance(box, Box):
+                continue
+            zone_id = _build_zone_id(symbol, box, "bullish")
+            zones.append(
+                {
+                    "zone_id": zone_id,
+                    "symbol": symbol,
+                    "direction": "bullish",
+                    "top": float(box.top),
+                    "bottom": float(box.bottom),
+                    "zone_text": box.text or "Demand Zone",
+                }
+            )
+    if supply is not None and hasattr(supply, "size"):
+        for i in range(supply.size()):
+            box = supply.get(i)
+            if not isinstance(box, Box):
+                continue
+            zone_id = _build_zone_id(symbol, box, "bearish")
+            zones.append(
+                {
+                    "zone_id": zone_id,
+                    "symbol": symbol,
+                    "direction": "bearish",
+                    "top": float(box.top),
+                    "bottom": float(box.bottom),
+                    "zone_text": box.text or "Supply Zone",
+                }
+            )
+    if TOP_N > 0 and len(zones) > TOP_N:
+        zones.sort(key=lambda z: abs(float(z["top"]) - float(z["bottom"])), reverse=True)
+        zones = zones[:TOP_N]
+    return zones
+
+
+def _touches_zone(price: float, zone: Dict[str, Any]) -> bool:
+    top = zone.get("top")
+    bottom = zone.get("bottom")
+    if top is None or bottom is None:
+        return False
+    lo = min(float(top), float(bottom))
+    hi = max(float(top), float(bottom))
+    return lo <= price <= hi
+
+
+def _compute_alert_score(zone_text: str) -> float:
+    text = (zone_text or "").lower()
+    if "idm" in text:
+        return 2.0
+    if "ext" in text:
+        return 1.5
+    if "ob" in text:
+        return 1.2
+    return 1.0
+
+
+def _fetch_ohlcv_guarded(
+    guard: _RestGuard,
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    *,
+    fast_scan: bool,
+) -> List[List[float]]:
+    _ensure_markets_loaded(exchange)
+    if fast_scan:
+        return guard.call(lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit), retries=3)
+
+    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+    timeframe_ms = timeframe_seconds * 1000
+    max_batch = 1500
+    since = 0
+    candles: List[List[float]] = []
+    target = limit if limit > 0 else None
+
+    while True:
+        request_limit = max_batch
+        if target is not None and target < max_batch and not candles:
+            request_limit = target
+        raw = guard.call(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since),
+            retries=3,
+        )
+        if not raw:
+            break
+        candles.extend(raw)
+        if target is not None and len(candles) > target:
+            candles = candles[-target:]
+        last_open = raw[-1][0]
+        next_since = last_open + timeframe_ms
+        if len(raw) < request_limit:
+            break
+        if next_since <= since:
+            next_since = since + timeframe_ms
+        since = next_since
+    return candles
+
+
+def _format_candles(candles: List[List[float]]) -> List[Dict[str, float]]:
+    return [
+        {
+            "time": c[0],
+            "open": c[1],
+            "high": c[2],
+            "low": c[3],
+            "close": c[4],
+            "volume": c[5] if len(c) > 5 else float("nan"),
+        }
+        for c in candles
+    ]
+
+
+def _zones_match(existing: Dict[str, Any], zones: List[Dict[str, Any]]) -> bool:
+    for zone in zones:
+        if zone.get("direction") != existing.get("direction"):
+            continue
+        top = zone.get("top")
+        bottom = zone.get("bottom")
+        if top is None or bottom is None:
+            continue
+        if abs(float(top) - float(existing.get("top", 0.0))) <= abs(float(top)) * 0.003 and abs(
+            float(bottom) - float(existing.get("bottom", 0.0))
+        ) <= abs(float(bottom)) * 0.003:
+            return True
+    return False
+
+
+def _confirm_touch(
+    guard: _RestGuard,
+    cache: _OHLCVCache,
+    exchange: Any,
+    zone: Dict[str, Any],
+    *,
+    timeframe: str,
+    limit: int,
+    inputs: IndicatorInputs,
+    recent_window: int,
+    fast_scan: bool,
+) -> bool:
+    symbol = zone["symbol"]
+    cache_key = f"{symbol}:{timeframe}:{limit}:confirm"
+    candles = cache.get(
+        cache_key,
+        ttl=0.0,
+        force=True,
+        fetcher=lambda: _fetch_ohlcv_guarded(guard, exchange, symbol, timeframe, limit, fast_scan=fast_scan),
+    )
+    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe)
+    runtime.process(_format_candles(candles))
+    metrics = runtime.gather_console_metrics()
+    latest_events = metrics.get("latest_events") or {}
+    recent_hits, _ = _collect_recent_event_hits(runtime.series, latest_events, bars=recent_window)
+    if recent_hits:
+        return True
+    zones = _extract_zones_from_runtime(runtime, symbol)
+    return _zones_match(zone, zones)
+
+
+def _run_pipeline_scanner(cfg: Settings, args: argparse.Namespace, inputs: IndicatorInputs) -> int:
+    guard = _RestGuard(REST_CALLS_PER_MIN, REST_CONCURRENCY)
+    cache = _OHLCVCache()
+    alert_state = _AlertState(ALERT_STATE_PATH)
+    aggregator = _AlertAggregator(flush_sec=ALERT_FLUSH_SEC, top_n=ALERT_TOP_N)
+    ex = _build_exchange(getattr(cfg, "market", "usdtm"))
+    GLOBAL_RATE_LIMITER.set_interval(max(cfg.rate_limit_sleep, 60.0 / REST_CALLS_PER_MIN))
+
+    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=cfg.max_scan, exchange=ex)
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        print("لا توجد رموز متاحة لوضع Pipeline بعد تطبيق الفلاتر.", flush=True)
+        return 0
+    if cfg.max_scan:
+        symbols = symbols[: int(cfg.max_scan)]
+
+    ws = _WSPriceFeed(url="wss://fstream.binance.com/ws/!ticker@arr")
+    ws.start()
+
+    zone_map: Dict[str, List[Dict[str, Any]]] = {}
+    rotation_index = 0
+    last_discovery = 0.0
+    first_cycle = True
+
+    def discover_batch(batch: List[str]) -> None:
+        if not batch:
+            return
+
+        def worker(sym: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+            try:
+                key = f"{sym}:{args.timeframe}:{args.limit}"
+                candles = cache.get(
+                    key,
+                    ttl=DISCOVERY_EVERY_SEC,
+                    fetcher=lambda: _fetch_ohlcv_guarded(
+                        guard, ex, sym, args.timeframe, args.limit, fast_scan=cfg.fast_scan
+                    ),
+                )
+                runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                runtime._bos_break_source = cfg.bos_confirmation
+                runtime._strict_close_for_break = cfg.strict_close_for_break
+                runtime.process(_format_candles(candles))
+                zones = _extract_zones_from_runtime(runtime, sym)
+                return sym, zones
+            except Exception as exc:
+                print(f"فشل الاكتشاف لـ {_format_symbol(sym)}: {exc}", flush=True)
+                return sym, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=REST_CONCURRENCY) as executor:
+            futures = [executor.submit(worker, sym) for sym in batch]
+            for future in concurrent.futures.as_completed(futures):
+                sym, zones = future.result()
+                if zones is not None:
+                    zone_map[sym] = zones
+
+    def rotate() -> None:
+        nonlocal rotation_index
+        batch = symbols[rotation_index : rotation_index + ROTATE_BATCH]
+        if not batch:
+            rotation_index = 0
+            batch = symbols[rotation_index : rotation_index + ROTATE_BATCH]
+        rotation_index += ROTATE_BATCH
+        discover_batch(batch)
+
+    try:
+        while True:
+            now = time.time()
+            if first_cycle:
+                initial = symbols[:INITIAL]
+                discover_batch(initial)
+                rotation_index = max(rotation_index, INITIAL)
+                last_discovery = now
+                first_cycle = False
+
+            if now - last_discovery >= DISCOVERY_EVERY_SEC:
+                rotate()
+                last_discovery = now
+
+            for sym, zones in list(zone_map.items()):
+                price = ws.get_price(sym)
+                if price is None:
+                    continue
+                for zone in zones:
+                    if not _touches_zone(price, zone):
+                        continue
+                    score = _compute_alert_score(zone.get("zone_text", ""))
+                    if score < MIN_ALERT_SCORE:
+                        continue
+                    if not alert_state.allow(sym, zone["zone_id"], now):
+                        continue
+                    if CONFIRM_TOUCH:
+                        ok = _confirm_touch(
+                            guard,
+                            cache,
+                            ex,
+                            zone,
+                            timeframe=args.timeframe,
+                            limit=args.limit,
+                            inputs=inputs,
+                            recent_window=1,
+                            fast_scan=cfg.fast_scan,
+                        )
+                        if not ok:
+                            continue
+                    alert_state.mark(sym, zone["zone_id"], now)
+                    payload = {
+                        "ts": int(now * 1000),
+                        "symbol": sym,
+                        "direction": zone["direction"],
+                        "price": price,
+                        "zone_id": zone["zone_id"],
+                        "zone_text": zone.get("zone_text", ""),
+                        "score": score,
+                    }
+                    aggregator.add(payload)
+                    try:
+                        with open(ALERTS_JSONL_PATH, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+
+            if aggregator.should_flush():
+                aggregator.flush(cfg=cfg)
+
+            time.sleep(LIVE_LOOP_SEC)
+            time.sleep(0)
+            if not cfg.continuous_scan:
+                if now - last_discovery >= DISCOVERY_EVERY_SEC:
+                    break
+    except KeyboardInterrupt:
+        print("تم إيقاف وضع Pipeline من قبل المستخدم.", flush=True)
+    finally:
+        ws.stop()
+    return 0
+
 def _parse_args_android():
     import argparse
     p = argparse.ArgumentParser(prog="SMC Binance Scanner (Android single-file)")
@@ -10318,6 +10919,13 @@ def _parse_args_android():
     p.add_argument("--limit", "-l", type=int, default=EDITOR_AUTORUN_DEFAULTS.candle_limit)
     p.add_argument("--max-symbols", "-n", type=int, default=EDITOR_AUTORUN_DEFAULTS.max_symbols)
     p.add_argument("--concurrency", type=int, default=EDITOR_AUTORUN_DEFAULTS.concurrency)
+    p.add_argument("--pipeline", action="store_true", default=False)
+    p.add_argument(
+        "--rate-limit-sleep",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.rate_limit_sleep,
+        help="فاصل زمني (ثوانٍ) بين طلبات Binance لتقليل الحظر أثناء التوازي",
+    )
     p.add_argument(
         "--fast-scan",
         dest="fast_scan",
@@ -10431,6 +11039,8 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.concurrency <= 0:
         p.error("--concurrency يجب أن يكون رقمًا موجبًا")
+    if args.rate_limit_sleep < 0.0:
+        p.error("--rate-limit-sleep يجب أن يكون رقمًا غير سالب")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
     if args.height_candles is not None and args.height_candles <= 0:
@@ -10497,6 +11107,8 @@ def _parse_args_android():
         concurrency=args.concurrency,
         min_change=args.min_change,
         fast_scan=args.fast_scan,
+        rate_limit_sleep=args.rate_limit_sleep,
+        pipeline=args.pipeline,
         height_candle_window=args.height_candles,
         height_scope=height_scope,
         height_metric=height_metric,
@@ -10581,10 +11193,12 @@ def _android_cli_entry() -> int:
     if ccxt is None:
         print("ccxt not installed. pip install ccxt", file=sys.stderr)
         return 2
+    _print_build_id()
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
 
     ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
+    GLOBAL_RATE_LIMITER.set_interval(cfg.rate_limit_sleep)
     print("بدء تشغيل ماسح Binance (وضع المحرر)...", flush=True)
     markets_ready = _ensure_markets_loaded(ex)
     if markets_ready:
@@ -10635,6 +11249,10 @@ def _android_cli_entry() -> int:
         structure_util=utils, ict_structure=ict,
     )
     inputs.console.max_age_bars = max(1, recent_window - 1)
+
+    if cfg.pipeline:
+        print("تشغيل وضع Pipeline (Discovery + Live Monitor)...", flush=True)
+        return _run_pipeline_scanner(cfg, args, inputs)
 
     symbol_override = args.symbol or None
     iteration = 0
@@ -10744,9 +11362,27 @@ def _android_cli_entry() -> int:
                         pass
                 return i, sym, runtime, recent_alerts, recent_hits, None
 
-            if cfg.concurrency > 1:
-                print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-            results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
+            try:
+                effective_concurrency = max(1, int(cfg.concurrency))
+            except (TypeError, ValueError):
+                effective_concurrency = 1
+            max_safe_workers = 8
+            if effective_concurrency > max_safe_workers:
+                print(
+                    f"تم تقليص التوازي إلى {max_safe_workers} لتجنّب حظر REST من Binance.",
+                    flush=True,
+                )
+                effective_concurrency = max_safe_workers
+            if effective_concurrency > 1:
+                print(f"تشغيل المسح بتوازي {effective_concurrency} مع حماية معدل الطلبات.", flush=True)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+                    futures = [
+                        executor.submit(scan_symbol, i, sym)
+                        for i, sym in enumerate(symbols, 1)
+                    ]
+                    results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            else:
+                results = [scan_symbol(i, sym) for i, sym in enumerate(symbols, 1)]
 
             results.sort(key=lambda item: item[0])
             for i, sym, runtime, recent_alerts, recent_hits, err in results:
@@ -10807,6 +11443,8 @@ def __router_main__():
             "--recent", str(defaults.recent_bars),
             "--verbose",
         ]
+        if defaults.rate_limit_sleep >= 0:
+            sys.argv += ["--rate-limit-sleep", str(defaults.rate_limit_sleep)]
         if defaults.height_threshold is not None:
             sys.argv += ["--min-change", str(defaults.height_threshold)]
         if defaults.height_candle_window is not None:
@@ -10823,6 +11461,8 @@ def __router_main__():
             sys.argv.append("--fast-scan")
         else:
             sys.argv.append("--no-fast-scan")
+        if defaults.pipeline:
+            sys.argv.append("--pipeline")
     return _android_cli_entry()
 
 # ============================================================================
