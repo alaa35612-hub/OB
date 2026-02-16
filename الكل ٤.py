@@ -211,6 +211,14 @@ SCANNER_CONTINUOUS = False
 SCANNER_INTERVAL = 2.0
 SCANNER_MIN_DAILY_CHANGE = 0.0
 
+# Multi-timeframe bridge (HTF analysis + LTF execution timing)
+MTF_BRIDGE_ENABLED = True
+MTF_BRIDGE_LTF_TIMEFRAME = "1m"
+MTF_BRIDGE_LTF_EVENT_AGE_BARS = 12
+
+# عند False: لا تفرض فلتر (Liquidity->Structure أو Retrace) قبل الطباعة.
+SCAN_REQUIRE_SIGNAL_FILTER = False
+
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
 EVENT_PRINT_MAX_AGE_BARS = 5
@@ -231,21 +239,22 @@ EVENT_PRINT_TOGGLES = {
     "MITIGATION_BLOCK": True,
     "PROPULSION_BLOCK": True,
     "IDM_OB": True,
-    "HIST_IDM_OB": False,
+    "HIST_IDM_OB": True,
     "EXT_OB": True,
-    "HIST_EXT_OB": False,
-    "DEMAND_ZONE": False,
-    "SUPPLY_ZONE": False,
-    "ORDER_FLOW_BREAK_MAJOR": False,
-    "ORDER_FLOW_BREAK_MINOR": False,
-    "ORDER_FLOW_MAJOR": False,
-    "ORDER_FLOW_MINOR": False,
+    "HIST_EXT_OB": True,
+    "DEMAND_ZONE": True,
+    "SUPPLY_ZONE": True,
+    "ORDER_FLOW_BREAK_MAJOR": True,
+    "ORDER_FLOW_BREAK_MINOR": True,
+    "ORDER_FLOW_MAJOR": True,
+    "ORDER_FLOW_MINOR": True,
     "SCOB": True,
     "SCOB_BULLISH": True,
     "SCOB_BEARISH": True,
     "INSIDE_BAR": True,
     "INSIDE_BAR_CANDLE": True,
     "FVG": True,
+    "LIQUIDITY_LEVEL": True,
     "LIQUIDITY_LEVELS": True,
     "LIQUIDITY_TOUCH": True,
     "GOLDEN_ZONE": True,
@@ -272,9 +281,9 @@ GOLDEN_ZONE_TOUCH_ONCE = True
 # عدّلها حسب رغبتك. القيم الافتراضية هنا مطابقة لإعداداتك التي ذكرتها.
 FEATURE_TOGGLES = {
     # Market Structure
-    "BOS_PLUS": False,
-    "BOS": False,
-    "CHOCH": False,
+    "BOS_PLUS": True,
+    "BOS": True,
+    "CHOCH": True,
     "MSS": True,
     "MSS_PLUS": True,
 
@@ -283,18 +292,18 @@ FEATURE_TOGGLES = {
     "LIQUIDITY_LEVEL": True,   # يدعم أيضًا المفتاح القديم "LIQUIDITY_LEVELS"
 
     # Structure utilities
-    "PDH": False,
-    "PDL": False,
-    "EQUILIBRIUM": False,
+    "PDH": True,
+    "PDL": True,
+    "EQUILIBRIUM": True,
 
     # Sweep / Mark X
-    "SWING_SWEEP": False,
-    "X": False,
+    "SWING_SWEEP": True,
+    "X": True,
 
     # Key levels
-    "KEY_LEVEL_4H":False,
-    "KEY_LEVEL_DAILY": False,
-    "KEY_LEVEL_WEEKLY": False,
+    "KEY_LEVEL_4H": True,
+    "KEY_LEVEL_DAILY": True,
+    "KEY_LEVEL_WEEKLY": True,
 }
 
 def apply_feature_toggles(inputs: "IndicatorInputs", toggles: Dict[str, bool]) -> None:
@@ -379,6 +388,7 @@ EVENT_PRINT_KEYS = {
     "INSIDE_BAR",
     "INSIDE_BAR_CANDLE",
     "FVG",
+    "LIQUIDITY_LEVEL",
     "LIQUIDITY_LEVELS",
     "LIQUIDITY_TOUCH",
     "GOLDEN_ZONE",
@@ -618,12 +628,16 @@ class ExecutionTracer:
         self.outfile = outfile
         self._events: List[TraceEvent] = []
         self.comparison: Optional[TraceComparisonResult] = None
+        self.context: Dict[str, Any] = {}
 
     def log(self, section: str, message: str, *, timestamp: Optional[int], **payload: Any) -> None:
         if not self.enabled:
             return
         event = TraceEvent(len(self._events), timestamp, section, message, payload)
         self._events.append(event)
+    def set_context(self, **context: Any) -> None:
+        self.context = dict(context)
+
 
     def emit(self) -> None:
         if not self.enabled or not self.outfile:
@@ -638,7 +652,11 @@ class ExecutionTracer:
             }
             for event in self._events
         ]
-        self.outfile.write_text(json.dumps(serialised, indent=2, ensure_ascii=False))
+        payload = {
+            "meta": _serialize_scalar(self.context),
+            "events": serialised,
+        }
+        self.outfile.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     def clear(self) -> None:
         self._events.clear()
@@ -650,8 +668,12 @@ class ExecutionTracer:
             raise FileNotFoundError(f"لم يتم العثور على ملف التتبع المرجعي: {reference}")
 
         raw_reference = json.loads(reference.read_text())
+        if isinstance(raw_reference, dict):
+            raw_events = raw_reference.get("events", [])
+        else:
+            raw_events = raw_reference
         ref_events: List[Dict[str, Any]] = []
-        for idx, entry in enumerate(raw_reference):
+        for idx, entry in enumerate(raw_events):
             if not isinstance(entry, dict):
                 raise ValueError("صيغة ملف التتبع المرجعي غير صحيحة")
             ref_events.append(self._normalise_reference_event(entry, idx))
@@ -8212,6 +8234,83 @@ def _fetch_recent_ohlcv(
         return []
 
 
+def _fetch_fast_ohlcv_rest(
+    session: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> Optional[List[Dict[str, float]]]:
+    """Fetch recent candles directly from Binance Futures REST with retries.
+
+    This path is intentionally sequential and reuses one HTTP session to reduce
+    connection overhead while staying below Binance rate limits.
+    """
+
+    if requests is None or session is None:
+        return None
+    rest_symbol = _binance_linear_symbol_id(symbol)
+    if not rest_symbol:
+        return None
+
+    request_limit = max(1, min(int(limit) if limit > 0 else 1500, 1500))
+    endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": rest_symbol,
+        "interval": timeframe,
+        "limit": request_limit,
+    }
+    timeout = (3.05, 10.0)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            GLOBAL_RATE_LIMITER.wait()
+            response = session.get(endpoint, params=params, timeout=timeout)
+            if response.status_code in (418, 429):
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                return None
+
+            candles: List[Dict[str, float]] = []
+            for entry in payload:
+                if not entry or len(entry) < 6:
+                    continue
+                t = _coerce_float(entry[0], default=NA)
+                o = _coerce_float(entry[1], default=NA)
+                h = _coerce_float(entry[2], default=NA)
+                l = _coerce_float(entry[3], default=NA)
+                c = _coerce_float(entry[4], default=NA)
+                v = _coerce_float(entry[5], default=0.0)
+                if math.isnan(t) or math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(c):
+                    continue
+                candles.append(
+                    {
+                        "time": int(t),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                )
+            return candles
+        except Exception as exc:  # pragma: no cover - network variability
+            last_exc = exc
+            ban_until = _extract_ban_until_ms(str(exc))
+            if ban_until:
+                _sleep_until(ban_until)
+            else:
+                time.sleep(_rate_limit_backoff(attempt + 1))
+    if last_exc is not None:
+        print(
+            f"تعذر الجلب السريع لشموع {symbol} عبر REST بعد عدة محاولات: {last_exc}",
+            flush=True,
+        )
+    return None
+
+
 def _binance_pick_symbols(
     exchange: Any,
     limit: int,
@@ -8640,7 +8739,9 @@ METRIC_LABELS = [
 EVENT_DISPLAY_ORDER = [
     ("BOS", "BOS"),
     ("BOS_PLUS", "BOS+"),
+    ("FUTURE_BOS", "Future BOS"),
     ("CHOCH", "CHOCH"),
+    ("FUTURE_CHOCH", "Future CHOCH"),
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
@@ -8648,6 +8749,10 @@ EVENT_DISPLAY_ORDER = [
     ("BREAKER_BLOCK", "Breaker Block"),
     ("MITIGATION_BLOCK", "Mitigation Block"),
     ("PROPULSION_BLOCK", "Propulsion Block"),
+    ("IDM_OB", "IDM OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
     ("DEMAND_ZONE", "Demand Zone"),
     ("SUPPLY_ZONE", "Supply Zone"),
     ("ORDER_FLOW_BREAK_MAJOR", "Order Flow Break (Major)"),
@@ -8659,18 +8764,22 @@ EVENT_DISPLAY_ORDER = [
     ("SCOB_BEARISH", "Bearish SCOB"),
     ("INSIDE_BAR", "Inside Bar"),
     ("INSIDE_BAR_CANDLE", "Inside Bar Candle"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("FVG", "FVG"),
+    ("LIQUIDITY_LEVEL", "Liquidity Levels"),
+    ("LIQUIDITY_LEVELS", "Liquidity Levels"),
+    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
     ("GOLDEN_ZONE", "Golden zone"),
     ("GOLDEN_ZONE_TOUCH", "Golden zone (Touch)"),
-    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
+    ("PDH", "PDH"),
+    ("PDL", "PDL"),
+    ("EQUILIBRIUM", "Equilibrium"),
+    ("SWING_SWEEP", "Swing Sweep"),
     ("X", "X"),
+    ("KEY_LEVEL_4H", "Key Level 4H"),
+    ("KEY_LEVEL_DAILY", "Key Level Daily"),
+    ("KEY_LEVEL_WEEKLY", "Key Level Weekly"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
 ]
 
 
@@ -8939,6 +9048,69 @@ def _signal_direction(payload: Dict[str, Any]) -> Optional[str]:
         return direction
     return _resolve_direction(payload.get("direction_display"), payload.get("text"), payload.get("display"))
 
+
+def _collect_bridge_candidates(latest_events: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for key, payload in latest_events.items():
+        if not isinstance(payload, dict):
+            continue
+        ts = _event_timestamp(payload)
+        if ts is None:
+            continue
+        price = payload.get("price")
+        level: Optional[Tuple[float, float]] = None
+        if isinstance(price, tuple) and len(price) == 2:
+            low = _coerce_float(price[0], default=NA)
+            high = _coerce_float(price[1], default=NA)
+            if not math.isnan(low) and not math.isnan(high):
+                level = (min(low, high), max(low, high))
+        elif isinstance(price, (int, float)):
+            value = float(price)
+            if not math.isnan(value):
+                level = (value, value)
+        if level is None:
+            continue
+        candidates.append({"key": str(key), "time": ts, "low": level[0], "high": level[1], "payload": payload})
+    return candidates
+
+
+def _bridge_ltf_hits(
+    ltf_candles: List[Dict[str, float]],
+    candidates: List[Dict[str, Any]],
+    *,
+    max_age_bars: int,
+) -> Dict[str, Dict[str, Any]]:
+    if not ltf_candles or not candidates:
+        return {}
+    max_age = max(1, int(max_age_bars))
+    start_index = max(0, len(ltf_candles) - max_age)
+    selected = ltf_candles[start_index:]
+    hits: Dict[str, Dict[str, Any]] = {}
+    for candle in selected:
+        c_time = int(candle.get("time", 0))
+        c_low = float(candle.get("low", NA))
+        c_high = float(candle.get("high", NA))
+        if math.isnan(c_low) or math.isnan(c_high):
+            continue
+        for item in candidates:
+            key = item["key"]
+            if key in hits:
+                continue
+            if c_time < int(item["time"]):
+                continue
+            low = float(item["low"])
+            high = float(item["high"])
+            if c_high < low or c_low > high:
+                continue
+            hits[key] = {
+                "key": key,
+                "ltf_time": c_time,
+                "ltf_price": max(low, min(high, float(candle.get("close", low)))),
+                "range": (low, high),
+            }
+    return hits
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8952,6 +9124,9 @@ def scan_binance(
     max_symbols: int | None = None,
     symbol_selector: 'BinanceSymbolSelectorConfig' | None = None,
     fast_scan: bool = True,
+    bridge_enabled: bool = MTF_BRIDGE_ENABLED,
+    bridge_ltf_timeframe: str = MTF_BRIDGE_LTF_TIMEFRAME,
+    bridge_event_age_bars: int = MTF_BRIDGE_LTF_EVENT_AGE_BARS,
 ) -> tuple['SmartMoneyAlgoProE5', list[dict]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8999,6 +9174,21 @@ def scan_binance(
 
     exchange_local = threading.local()
 
+    rest_session: Optional[Any] = None
+    if fast_scan and requests is not None:
+        rest_session = requests.Session()
+        if HTTPAdapter is not None and Retry is not None:
+            retries = Retry(
+                total=2,
+                backoff_factor=0.4,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=("GET",),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=1, pool_maxsize=1)
+            rest_session.mount("https://", adapter)
+            rest_session.mount("http://", adapter)
+
     def _get_exchange() -> object:
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
@@ -9037,12 +9227,55 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+            candles: List[Dict[str, float]]
+            fast_candles = _fetch_fast_ohlcv_rest(rest_session, symbol, timeframe, limit)
+            if fast_scan and fast_candles is not None:
+                candles = fast_candles
+            else:
+                candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
             latest_events = metrics.get("latest_events") or {}
             recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
+
+            bridge_hits: Dict[str, Dict[str, Any]] = {}
+            if bridge_enabled and latest_events:
+                ltf_limit = max(50, int(bridge_event_age_bars) + 5)
+                ltf_candles = fetch_ohlcv(
+                    _get_exchange(),
+                    symbol,
+                    bridge_ltf_timeframe,
+                    ltf_limit,
+                    fast_scan=True,
+                )
+                candidates = _collect_bridge_candidates(latest_events)
+                bridge_hits = _bridge_ltf_hits(
+                    ltf_candles,
+                    candidates,
+                    max_age_bars=bridge_event_age_bars,
+                )
+                if bridge_hits:
+                    for key, hit in bridge_hits.items():
+                        if key not in recent_hits:
+                            recent_hits.append(key)
+                        payload = latest_events.get(key)
+                        if isinstance(payload, dict):
+                            payload["time"] = hit["ltf_time"]
+                            payload["time_display"] = format_timestamp(hit["ltf_time"])
+                            payload["display"] = f"{payload.get('display', key)} | LTF trigger @ {format_price(hit['ltf_price'])}"
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "mtf_bridge",
+                            "ltf_trigger_detected",
+                            timestamp=max((v.get("ltf_time", 0) for v in bridge_hits.values()), default=None),
+                            symbol=symbol,
+                            analysis_timeframe=timeframe,
+                            execution_timeframe=bridge_ltf_timeframe,
+                            event_keys=sorted(bridge_hits.keys()),
+                            ltf_event_age_bars=bridge_event_age_bars,
+                        )
+
             if not recent_hits:
                 if not SILENT_WHEN_NO_EVENTS:
                     print(
@@ -9109,7 +9342,7 @@ def scan_binance(
                     if isinstance(fvg_payload, dict) and _price_in_range(close_price, fvg_payload):
                         retrace_match = True
 
-            if not (liquidity_structure_match or retrace_match):
+            if SCAN_REQUIRE_SIGNAL_FILTER and not (liquidity_structure_match or retrace_match):
                 if tracer and tracer.enabled:
                     tracer.log(
                         "scan",
@@ -9143,6 +9376,13 @@ def scan_binance(
                 "alerts": metrics.get("alerts", len(getattr(runtime, "alerts", []))),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
+                "bridge": {
+                    "enabled": bool(bridge_enabled),
+                    "analysis_timeframe": timeframe,
+                    "execution_timeframe": bridge_ltf_timeframe,
+                    "event_age_ltf_bars": int(bridge_event_age_bars),
+                    "hits": sorted(bridge_hits.keys()) if bridge_hits else [],
+                },
             }
             if not EVENT_PRINT_ONLY:
                 print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
@@ -9160,9 +9400,13 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    if concurrency > 1:
-        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    try:
+        if concurrency > 1:
+            print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    finally:
+        if rest_session is not None:
+            rest_session.close()
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
@@ -9277,6 +9521,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
     )
     parser.add_argument(
+        "--ltf-timeframe",
+        type=str,
+        default=MTF_BRIDGE_LTF_TIMEFRAME,
+        help="الإطار الزمني الصغير (LTF) للتفعيل اللحظي لإشارات HTF",
+    )
+    parser.add_argument(
+        "--ltf-event-age-bars",
+        type=int,
+        default=MTF_BRIDGE_LTF_EVENT_AGE_BARS,
+        help="عمر الإشارة على فريم LTF بعدد الشموع",
+    )
+    parser.add_argument(
+        "--disable-mtf-bridge",
+        dest="mtf_bridge_enabled",
+        action="store_false",
+        default=MTF_BRIDGE_ENABLED,
+        help="تعطيل جسر HTF->LTF",
+    )
+    parser.add_argument(
         "--fast-scan",
         dest="fast_scan",
         action=_OptionalBoolAction,
@@ -9296,10 +9559,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
+    if args.ltf_event_age_bars <= 0:
+        parser.error("--ltf-event-age-bars يجب أن يكون رقمًا موجبًا")
     if args.continuous_scan and args.scan_interval <= 0.0:
         args.scan_interval = max(EDITOR_AUTORUN_DEFAULTS.scan_interval, 2.0)
 
     tracer = ExecutionTracer(enabled=args.trace, outfile=args.trace_file)
+    tracer.set_context(
+        mode="HTF analysis + LTF execution",
+        analysis_timeframe=args.timeframe,
+        execution_timeframe=args.ltf_timeframe,
+        ltf_event_age_bars=args.ltf_event_age_bars,
+        mtf_bridge_enabled=args.mtf_bridge_enabled,
+    )
 
     # تحميل كاش الأحداث المرسلة (لمنع تكرار الإشعارات بين الدورات)
     _load_event_seen_cache()
@@ -9307,6 +9579,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     def perform_comparison() -> None:
         if args.compare_trace:
+            print(
+                f"مقارنة التتبع بنمط الجسر الزمني: HTF({args.timeframe}) للتحليل / LTF({args.ltf_timeframe}) للتوقيت",
+                flush=True,
+            )
             result = tracer.compare(args.compare_trace)
             print_trace_comparison(result)
 
@@ -9364,7 +9640,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                recent_window_bars=args.max_age_bars,
                 fast_scan=args.fast_scan,
+                bridge_enabled=args.mtf_bridge_enabled,
+                bridge_ltf_timeframe=args.ltf_timeframe,
+                bridge_event_age_bars=args.ltf_event_age_bars,
             )
             perform_comparison()
             tracer.emit()
