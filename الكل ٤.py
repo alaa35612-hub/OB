@@ -211,6 +211,9 @@ SCANNER_CONTINUOUS = False
 SCANNER_INTERVAL = 2.0
 SCANNER_MIN_DAILY_CHANGE = 0.0
 
+# عند False: لا تفرض فلتر (Liquidity->Structure أو Retrace) قبل الطباعة.
+SCAN_REQUIRE_SIGNAL_FILTER = False
+
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
 EVENT_PRINT_MAX_AGE_BARS = 5
@@ -231,21 +234,22 @@ EVENT_PRINT_TOGGLES = {
     "MITIGATION_BLOCK": True,
     "PROPULSION_BLOCK": True,
     "IDM_OB": True,
-    "HIST_IDM_OB": False,
+    "HIST_IDM_OB": True,
     "EXT_OB": True,
-    "HIST_EXT_OB": False,
-    "DEMAND_ZONE": False,
-    "SUPPLY_ZONE": False,
-    "ORDER_FLOW_BREAK_MAJOR": False,
-    "ORDER_FLOW_BREAK_MINOR": False,
-    "ORDER_FLOW_MAJOR": False,
-    "ORDER_FLOW_MINOR": False,
+    "HIST_EXT_OB": True,
+    "DEMAND_ZONE": True,
+    "SUPPLY_ZONE": True,
+    "ORDER_FLOW_BREAK_MAJOR": True,
+    "ORDER_FLOW_BREAK_MINOR": True,
+    "ORDER_FLOW_MAJOR": True,
+    "ORDER_FLOW_MINOR": True,
     "SCOB": True,
     "SCOB_BULLISH": True,
     "SCOB_BEARISH": True,
     "INSIDE_BAR": True,
     "INSIDE_BAR_CANDLE": True,
     "FVG": True,
+    "LIQUIDITY_LEVEL": True,
     "LIQUIDITY_LEVELS": True,
     "LIQUIDITY_TOUCH": True,
     "GOLDEN_ZONE": True,
@@ -272,9 +276,9 @@ GOLDEN_ZONE_TOUCH_ONCE = True
 # عدّلها حسب رغبتك. القيم الافتراضية هنا مطابقة لإعداداتك التي ذكرتها.
 FEATURE_TOGGLES = {
     # Market Structure
-    "BOS_PLUS": False,
-    "BOS": False,
-    "CHOCH": False,
+    "BOS_PLUS": True,
+    "BOS": True,
+    "CHOCH": True,
     "MSS": True,
     "MSS_PLUS": True,
 
@@ -283,18 +287,18 @@ FEATURE_TOGGLES = {
     "LIQUIDITY_LEVEL": True,   # يدعم أيضًا المفتاح القديم "LIQUIDITY_LEVELS"
 
     # Structure utilities
-    "PDH": False,
-    "PDL": False,
-    "EQUILIBRIUM": False,
+    "PDH": True,
+    "PDL": True,
+    "EQUILIBRIUM": True,
 
     # Sweep / Mark X
-    "SWING_SWEEP": False,
-    "X": False,
+    "SWING_SWEEP": True,
+    "X": True,
 
     # Key levels
-    "KEY_LEVEL_4H":False,
-    "KEY_LEVEL_DAILY": False,
-    "KEY_LEVEL_WEEKLY": False,
+    "KEY_LEVEL_4H": True,
+    "KEY_LEVEL_DAILY": True,
+    "KEY_LEVEL_WEEKLY": True,
 }
 
 def apply_feature_toggles(inputs: "IndicatorInputs", toggles: Dict[str, bool]) -> None:
@@ -379,6 +383,7 @@ EVENT_PRINT_KEYS = {
     "INSIDE_BAR",
     "INSIDE_BAR_CANDLE",
     "FVG",
+    "LIQUIDITY_LEVEL",
     "LIQUIDITY_LEVELS",
     "LIQUIDITY_TOUCH",
     "GOLDEN_ZONE",
@@ -8717,7 +8722,9 @@ METRIC_LABELS = [
 EVENT_DISPLAY_ORDER = [
     ("BOS", "BOS"),
     ("BOS_PLUS", "BOS+"),
+    ("FUTURE_BOS", "Future BOS"),
     ("CHOCH", "CHOCH"),
+    ("FUTURE_CHOCH", "Future CHOCH"),
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
@@ -8725,6 +8732,10 @@ EVENT_DISPLAY_ORDER = [
     ("BREAKER_BLOCK", "Breaker Block"),
     ("MITIGATION_BLOCK", "Mitigation Block"),
     ("PROPULSION_BLOCK", "Propulsion Block"),
+    ("IDM_OB", "IDM OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
     ("DEMAND_ZONE", "Demand Zone"),
     ("SUPPLY_ZONE", "Supply Zone"),
     ("ORDER_FLOW_BREAK_MAJOR", "Order Flow Break (Major)"),
@@ -8736,18 +8747,22 @@ EVENT_DISPLAY_ORDER = [
     ("SCOB_BEARISH", "Bearish SCOB"),
     ("INSIDE_BAR", "Inside Bar"),
     ("INSIDE_BAR_CANDLE", "Inside Bar Candle"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("FVG", "FVG"),
+    ("LIQUIDITY_LEVEL", "Liquidity Levels"),
+    ("LIQUIDITY_LEVELS", "Liquidity Levels"),
+    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
     ("GOLDEN_ZONE", "Golden zone"),
     ("GOLDEN_ZONE_TOUCH", "Golden zone (Touch)"),
-    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
+    ("PDH", "PDH"),
+    ("PDL", "PDL"),
+    ("EQUILIBRIUM", "Equilibrium"),
+    ("SWING_SWEEP", "Swing Sweep"),
     ("X", "X"),
+    ("KEY_LEVEL_4H", "Key Level 4H"),
+    ("KEY_LEVEL_DAILY", "Key Level Daily"),
+    ("KEY_LEVEL_WEEKLY", "Key Level Weekly"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
 ]
 
 
@@ -9206,7 +9221,7 @@ def scan_binance(
                     if isinstance(fvg_payload, dict) and _price_in_range(close_price, fvg_payload):
                         retrace_match = True
 
-            if not (liquidity_structure_match or retrace_match):
+            if SCAN_REQUIRE_SIGNAL_FILTER and not (liquidity_structure_match or retrace_match):
                 if tracer and tracer.enabled:
                     tracer.log(
                         "scan",
