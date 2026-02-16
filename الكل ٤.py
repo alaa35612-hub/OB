@@ -1228,7 +1228,8 @@ class CandleInputs:
 
 @dataclass
 class ConsoleInputs:
-    max_age_bars: int = 1
+    # 0 = بدون فلترة عمر الأحداث (اعرض آخر إشارة لكل نوع مهما كان عمرها)
+    max_age_bars: int = 0
 
 
 @dataclass
@@ -1696,7 +1697,8 @@ class SmartMoneyAlgoProE5:
                 max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
             except (TypeError, ValueError):
                 max_age = 1
-        self.console_max_age_bars = max(1, max_age)
+        # 0 يعني تعطيل فلتر العمر تمامًا
+        self.console_max_age_bars = max(0, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -8960,11 +8962,12 @@ def _format_event_line(key: str, payload: Dict[str, Any]) -> str:
 
 def _emit_recent_events(symbol: str, timeframe: str, latest_events: Dict[str, Any], recent_hits: List[str]) -> List[str]:
     """Return formatted lines for events that happened in the most recent candles only."""
-    if not recent_hits:
+    selected_keys = recent_hits or list(latest_events.keys())
+    if not selected_keys:
         return []
     order_map: Dict[str, int] = {name: idx for idx, (name, _) in enumerate(EVENT_DISPLAY_ORDER)}
     items: List[Tuple[int, int, str, Dict[str, Any]]] = []
-    for key in recent_hits:
+    for key in selected_keys:
         payload = latest_events.get(key)
         if not isinstance(payload, dict):
             continue
@@ -9155,16 +9158,16 @@ def scan_binance(
             metrics = runtime.gather_console_metrics()
             latest_events = metrics.get("latest_events") or {}
             recent_hits, recent_times = _collect_recent_event_hits(runtime.series, latest_events, bars=window)
-            if not recent_hits:
+            if not recent_hits and not latest_events:
                 if not SILENT_WHEN_NO_EVENTS:
                     print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث مسجلة",
                         flush=True,
                     )
                 if tracer and tracer.enabled:
                     tracer.log(
                         "scan",
-                        "symbol_skipped_stale_events",
+                        "symbol_skipped_no_events",
                         timestamp=runtime.series.get_time(0) or None,
                         symbol=symbol,
                         timeframe=timeframe,
@@ -9369,7 +9372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--max-age-bars",
         type=int,
         default=EVENT_PRINT_MAX_AGE_BARS,
-        help="Ignore console events older than this many completed bars (minimum 1)",
+        help="Ignore console events older than this many completed bars (0 = disable age filter)",
     )
     parser.add_argument(
         "--continuous",
@@ -9408,8 +9411,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
-    if args.max_age_bars <= 0:
-        parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
+    if args.max_age_bars < 0:
+        parser.error("--max-age-bars يجب أن يكون رقمًا غير سالب (0 لتعطيل فلتر العمر)")
     if args.scan_interval < 0.0:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
     if args.continuous_scan and args.scan_interval <= 0.0:
