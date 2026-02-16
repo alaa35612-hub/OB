@@ -211,6 +211,9 @@ SCANNER_CONTINUOUS = False
 SCANNER_INTERVAL = 2.0
 SCANNER_MIN_DAILY_CHANGE = 0.0
 
+# عند False: لا تفرض فلتر (Liquidity->Structure أو Retrace) قبل الطباعة.
+SCAN_REQUIRE_SIGNAL_FILTER = False
+
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
 EVENT_PRINT_MAX_AGE_BARS = 5
@@ -231,21 +234,22 @@ EVENT_PRINT_TOGGLES = {
     "MITIGATION_BLOCK": True,
     "PROPULSION_BLOCK": True,
     "IDM_OB": True,
-    "HIST_IDM_OB": False,
+    "HIST_IDM_OB": True,
     "EXT_OB": True,
-    "HIST_EXT_OB": False,
-    "DEMAND_ZONE": False,
-    "SUPPLY_ZONE": False,
-    "ORDER_FLOW_BREAK_MAJOR": False,
-    "ORDER_FLOW_BREAK_MINOR": False,
-    "ORDER_FLOW_MAJOR": False,
-    "ORDER_FLOW_MINOR": False,
+    "HIST_EXT_OB": True,
+    "DEMAND_ZONE": True,
+    "SUPPLY_ZONE": True,
+    "ORDER_FLOW_BREAK_MAJOR": True,
+    "ORDER_FLOW_BREAK_MINOR": True,
+    "ORDER_FLOW_MAJOR": True,
+    "ORDER_FLOW_MINOR": True,
     "SCOB": True,
     "SCOB_BULLISH": True,
     "SCOB_BEARISH": True,
     "INSIDE_BAR": True,
     "INSIDE_BAR_CANDLE": True,
     "FVG": True,
+    "LIQUIDITY_LEVEL": True,
     "LIQUIDITY_LEVELS": True,
     "LIQUIDITY_TOUCH": True,
     "GOLDEN_ZONE": True,
@@ -272,9 +276,9 @@ GOLDEN_ZONE_TOUCH_ONCE = True
 # عدّلها حسب رغبتك. القيم الافتراضية هنا مطابقة لإعداداتك التي ذكرتها.
 FEATURE_TOGGLES = {
     # Market Structure
-    "BOS_PLUS": False,
-    "BOS": False,
-    "CHOCH": False,
+    "BOS_PLUS": True,
+    "BOS": True,
+    "CHOCH": True,
     "MSS": True,
     "MSS_PLUS": True,
 
@@ -283,18 +287,18 @@ FEATURE_TOGGLES = {
     "LIQUIDITY_LEVEL": True,   # يدعم أيضًا المفتاح القديم "LIQUIDITY_LEVELS"
 
     # Structure utilities
-    "PDH": False,
-    "PDL": False,
-    "EQUILIBRIUM": False,
+    "PDH": True,
+    "PDL": True,
+    "EQUILIBRIUM": True,
 
     # Sweep / Mark X
-    "SWING_SWEEP": False,
-    "X": False,
+    "SWING_SWEEP": True,
+    "X": True,
 
     # Key levels
-    "KEY_LEVEL_4H":False,
-    "KEY_LEVEL_DAILY": False,
-    "KEY_LEVEL_WEEKLY": False,
+    "KEY_LEVEL_4H": True,
+    "KEY_LEVEL_DAILY": True,
+    "KEY_LEVEL_WEEKLY": True,
 }
 
 def apply_feature_toggles(inputs: "IndicatorInputs", toggles: Dict[str, bool]) -> None:
@@ -379,6 +383,7 @@ EVENT_PRINT_KEYS = {
     "INSIDE_BAR",
     "INSIDE_BAR_CANDLE",
     "FVG",
+    "LIQUIDITY_LEVEL",
     "LIQUIDITY_LEVELS",
     "LIQUIDITY_TOUCH",
     "GOLDEN_ZONE",
@@ -8212,6 +8217,83 @@ def _fetch_recent_ohlcv(
         return []
 
 
+def _fetch_fast_ohlcv_rest(
+    session: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> Optional[List[Dict[str, float]]]:
+    """Fetch recent candles directly from Binance Futures REST with retries.
+
+    This path is intentionally sequential and reuses one HTTP session to reduce
+    connection overhead while staying below Binance rate limits.
+    """
+
+    if requests is None or session is None:
+        return None
+    rest_symbol = _binance_linear_symbol_id(symbol)
+    if not rest_symbol:
+        return None
+
+    request_limit = max(1, min(int(limit) if limit > 0 else 1500, 1500))
+    endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": rest_symbol,
+        "interval": timeframe,
+        "limit": request_limit,
+    }
+    timeout = (3.05, 10.0)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            GLOBAL_RATE_LIMITER.wait()
+            response = session.get(endpoint, params=params, timeout=timeout)
+            if response.status_code in (418, 429):
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                return None
+
+            candles: List[Dict[str, float]] = []
+            for entry in payload:
+                if not entry or len(entry) < 6:
+                    continue
+                t = _coerce_float(entry[0], default=NA)
+                o = _coerce_float(entry[1], default=NA)
+                h = _coerce_float(entry[2], default=NA)
+                l = _coerce_float(entry[3], default=NA)
+                c = _coerce_float(entry[4], default=NA)
+                v = _coerce_float(entry[5], default=0.0)
+                if math.isnan(t) or math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(c):
+                    continue
+                candles.append(
+                    {
+                        "time": int(t),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                )
+            return candles
+        except Exception as exc:  # pragma: no cover - network variability
+            last_exc = exc
+            ban_until = _extract_ban_until_ms(str(exc))
+            if ban_until:
+                _sleep_until(ban_until)
+            else:
+                time.sleep(_rate_limit_backoff(attempt + 1))
+    if last_exc is not None:
+        print(
+            f"تعذر الجلب السريع لشموع {symbol} عبر REST بعد عدة محاولات: {last_exc}",
+            flush=True,
+        )
+    return None
+
+
 def _binance_pick_symbols(
     exchange: Any,
     limit: int,
@@ -8640,7 +8722,9 @@ METRIC_LABELS = [
 EVENT_DISPLAY_ORDER = [
     ("BOS", "BOS"),
     ("BOS_PLUS", "BOS+"),
+    ("FUTURE_BOS", "Future BOS"),
     ("CHOCH", "CHOCH"),
+    ("FUTURE_CHOCH", "Future CHOCH"),
     ("MSS_PLUS", "MSS+"),
     ("MSS", "MSS"),
     ("IDM", "IDM"),
@@ -8648,6 +8732,10 @@ EVENT_DISPLAY_ORDER = [
     ("BREAKER_BLOCK", "Breaker Block"),
     ("MITIGATION_BLOCK", "Mitigation Block"),
     ("PROPULSION_BLOCK", "Propulsion Block"),
+    ("IDM_OB", "IDM OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
     ("DEMAND_ZONE", "Demand Zone"),
     ("SUPPLY_ZONE", "Supply Zone"),
     ("ORDER_FLOW_BREAK_MAJOR", "Order Flow Break (Major)"),
@@ -8659,18 +8747,22 @@ EVENT_DISPLAY_ORDER = [
     ("SCOB_BEARISH", "Bearish SCOB"),
     ("INSIDE_BAR", "Inside Bar"),
     ("INSIDE_BAR_CANDLE", "Inside Bar Candle"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("FVG", "FVG"),
+    ("LIQUIDITY_LEVEL", "Liquidity Levels"),
+    ("LIQUIDITY_LEVELS", "Liquidity Levels"),
+    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
     ("GOLDEN_ZONE", "Golden zone"),
     ("GOLDEN_ZONE_TOUCH", "Golden zone (Touch)"),
-    ("LIQUIDITY_TOUCH", "Liquidity Sweep"),
+    ("PDH", "PDH"),
+    ("PDL", "PDL"),
+    ("EQUILIBRIUM", "Equilibrium"),
+    ("SWING_SWEEP", "Swing Sweep"),
     ("X", "X"),
+    ("KEY_LEVEL_4H", "Key Level 4H"),
+    ("KEY_LEVEL_DAILY", "Key Level Daily"),
+    ("KEY_LEVEL_WEEKLY", "Key Level Weekly"),
     ("RED_CIRCLE", "الدوائر الحمراء"),
     ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
 ]
 
 
@@ -8999,6 +9091,21 @@ def scan_binance(
 
     exchange_local = threading.local()
 
+    rest_session: Optional[Any] = None
+    if fast_scan and requests is not None:
+        rest_session = requests.Session()
+        if HTTPAdapter is not None and Retry is not None:
+            retries = Retry(
+                total=2,
+                backoff_factor=0.4,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=("GET",),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=1, pool_maxsize=1)
+            rest_session.mount("https://", adapter)
+            rest_session.mount("http://", adapter)
+
     def _get_exchange() -> object:
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
@@ -9037,7 +9144,12 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+            candles: List[Dict[str, float]]
+            fast_candles = _fetch_fast_ohlcv_rest(rest_session, symbol, timeframe, limit)
+            if fast_scan and fast_candles is not None:
+                candles = fast_candles
+            else:
+                candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
@@ -9109,7 +9221,7 @@ def scan_binance(
                     if isinstance(fvg_payload, dict) and _price_in_range(close_price, fvg_payload):
                         retrace_match = True
 
-            if not (liquidity_structure_match or retrace_match):
+            if SCAN_REQUIRE_SIGNAL_FILTER and not (liquidity_structure_match or retrace_match):
                 if tracer and tracer.enabled:
                     tracer.log(
                         "scan",
@@ -9160,9 +9272,13 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    if concurrency > 1:
-        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    try:
+        if concurrency > 1:
+            print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    finally:
+        if rest_session is not None:
+            rest_session.close()
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
