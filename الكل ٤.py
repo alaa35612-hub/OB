@@ -8212,6 +8212,83 @@ def _fetch_recent_ohlcv(
         return []
 
 
+def _fetch_fast_ohlcv_rest(
+    session: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> Optional[List[Dict[str, float]]]:
+    """Fetch recent candles directly from Binance Futures REST with retries.
+
+    This path is intentionally sequential and reuses one HTTP session to reduce
+    connection overhead while staying below Binance rate limits.
+    """
+
+    if requests is None or session is None:
+        return None
+    rest_symbol = _binance_linear_symbol_id(symbol)
+    if not rest_symbol:
+        return None
+
+    request_limit = max(1, min(int(limit) if limit > 0 else 1500, 1500))
+    endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    params = {
+        "symbol": rest_symbol,
+        "interval": timeframe,
+        "limit": request_limit,
+    }
+    timeout = (3.05, 10.0)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            GLOBAL_RATE_LIMITER.wait()
+            response = session.get(endpoint, params=params, timeout=timeout)
+            if response.status_code in (418, 429):
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                return None
+
+            candles: List[Dict[str, float]] = []
+            for entry in payload:
+                if not entry or len(entry) < 6:
+                    continue
+                t = _coerce_float(entry[0], default=NA)
+                o = _coerce_float(entry[1], default=NA)
+                h = _coerce_float(entry[2], default=NA)
+                l = _coerce_float(entry[3], default=NA)
+                c = _coerce_float(entry[4], default=NA)
+                v = _coerce_float(entry[5], default=0.0)
+                if math.isnan(t) or math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(c):
+                    continue
+                candles.append(
+                    {
+                        "time": int(t),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                )
+            return candles
+        except Exception as exc:  # pragma: no cover - network variability
+            last_exc = exc
+            ban_until = _extract_ban_until_ms(str(exc))
+            if ban_until:
+                _sleep_until(ban_until)
+            else:
+                time.sleep(_rate_limit_backoff(attempt + 1))
+    if last_exc is not None:
+        print(
+            f"تعذر الجلب السريع لشموع {symbol} عبر REST بعد عدة محاولات: {last_exc}",
+            flush=True,
+        )
+    return None
+
+
 def _binance_pick_symbols(
     exchange: Any,
     limit: int,
@@ -8999,6 +9076,21 @@ def scan_binance(
 
     exchange_local = threading.local()
 
+    rest_session: Optional[Any] = None
+    if fast_scan and requests is not None:
+        rest_session = requests.Session()
+        if HTTPAdapter is not None and Retry is not None:
+            retries = Retry(
+                total=2,
+                backoff_factor=0.4,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=("GET",),
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retries, pool_connections=1, pool_maxsize=1)
+            rest_session.mount("https://", adapter)
+            rest_session.mount("http://", adapter)
+
     def _get_exchange() -> object:
         local_exchange = getattr(exchange_local, "client", None)
         if local_exchange is None:
@@ -9037,7 +9129,12 @@ def scan_binance(
                         threshold=min_daily_change,
                     )
                 return idx, None, None
-            candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
+            candles: List[Dict[str, float]]
+            fast_candles = _fetch_fast_ohlcv_rest(rest_session, symbol, timeframe, limit)
+            if fast_scan and fast_candles is not None:
+                candles = fast_candles
+            else:
+                candles = fetch_ohlcv(_get_exchange(), symbol, timeframe, limit, fast_scan=fast_scan)
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
             runtime.process(candles)
             metrics = runtime.gather_console_metrics()
@@ -9160,9 +9257,13 @@ def scan_binance(
             print(f"فشل مسح {_format_symbol(symbol)}: {exc}", flush=True)
             return idx, None, None
 
-    if concurrency > 1:
-        print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
-    results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    try:
+        if concurrency > 1:
+            print("تم فرض التوازي = 1 لتجنّب حظر REST من Binance.", flush=True)
+        results = [scan_symbol(idx, symbol) for idx, symbol in enumerate(all_symbols)]
+    finally:
+        if rest_session is not None:
+            rest_session.close()
 
     results.sort(key=lambda item: item[0])
     for idx, runtime, summary in results:
