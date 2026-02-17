@@ -214,6 +214,14 @@ SCANNER_MIN_DAILY_CHANGE = 0.0
 # عند False: لا تفرض فلتر (Liquidity->Structure أو Retrace) قبل الطباعة.
 SCAN_REQUIRE_SIGNAL_FILTER = False
 
+# عند True: يطبع فقط العملات التي حدث فيها CHOCH داخل نافذة الحداثة
+# أو تحققت فيها حالة: لمس سيولة ثم تراجع وترك FVG.
+SCAN_REQUIRE_CHOCH_EVENT = True
+
+# عند True: إذا حدث CHOCH يجب أن يعود السعر إلى أحد المستويات المطلوبة قبل الطباعة.
+SCAN_REQUIRE_CHOCH_RETRACE = True
+SCAN_CHOCH_PRICE_RETURN_TOLERANCE = 0.001  # 0.1%
+
 # فلتر عمر الأحداث (بعدد الشموع)
 EVENT_PRINT_ENABLED = True
 EVENT_PRINT_MAX_AGE_BARS = 5
@@ -9025,6 +9033,46 @@ def _price_in_range(price: float, payload: Dict[str, Any]) -> bool:
         return low <= price <= high
     return False
 
+def _price_near_level(price: float, level: float, tolerance_ratio: float) -> bool:
+    if math.isnan(price) or math.isnan(level):
+        return False
+    tolerance = abs(level) * max(tolerance_ratio, 0.0)
+    if tolerance == 0.0:
+        tolerance = 1e-12
+    return abs(price - level) <= tolerance
+
+
+def _collect_choch_retrace_matches(close_price: float, latest_events: Dict[str, Any]) -> List[str]:
+    matches: List[str] = []
+    if math.isnan(close_price):
+        return matches
+
+    zone_keys = (
+        ("EXT_OB", "EXT OB"),
+        ("IDM_OB", "IDM OB"),
+        ("HIST_IDM_OB", "Hist IDM OB"),
+        ("HIST_EXT_OB", "Hist EXT OB"),
+        ("GOLDEN_ZONE", "OTE"),
+        ("FVG", "FAIR VALUE GAPS"),
+    )
+
+    for key, label in zone_keys:
+        payload = latest_events.get(key)
+        if isinstance(payload, dict) and _price_in_range(close_price, payload):
+            matches.append(label)
+
+    choch_payload = latest_events.get("CHOCH")
+    if isinstance(choch_payload, dict):
+        choch_price = choch_payload.get("price")
+        if isinstance(choch_price, (int, float)) and _price_near_level(
+            close_price,
+            float(choch_price),
+            SCAN_CHOCH_PRICE_RETURN_TOLERANCE,
+        ):
+            matches.append("سعر مستوى CHOCH")
+
+    return matches
+
 def _signal_direction(payload: Dict[str, Any]) -> Optional[str]:
     direction = payload.get("direction")
     if direction in ("bullish", "bearish"):
@@ -9177,6 +9225,31 @@ def scan_binance(
                 latest_events,
                 ("LIQUIDITY_TOUCH",),
             )
+            fvg_key, fvg_payload_for_liquidity, fvg_time = _latest_event_payload(
+                latest_events,
+                ("FVG",),
+            )
+            liquidity_fvg_match = (
+                liquidity_payload is not None
+                and liquidity_time is not None
+                and fvg_payload_for_liquidity is not None
+                and fvg_time is not None
+                and fvg_time >= liquidity_time
+            )
+
+            if SCAN_REQUIRE_CHOCH_EVENT and "CHOCH" not in recent_hits and not liquidity_fvg_match:
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_no_choch",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        recent_hits=recent_hits,
+                        liquidity_fvg_match=liquidity_fvg_match,
+                    )
+                return idx, None, None
+
             structure_key, structure_payload, structure_time = _latest_event_payload(
                 latest_events,
                 ("MSS", "MSS_PLUS", "BOS", "BOS_PLUS", "CHOCH"),
@@ -9195,6 +9268,7 @@ def scan_binance(
             signal_direction = _signal_direction(signal_payload or {})
             close_price = runtime.series.get("close")
             retrace_match = False
+            retrace_matches: List[str] = []
             if signal_payload and signal_direction and not math.isnan(close_price):
                 fvg_holder = (
                     getattr(runtime, "bullish_gap_holder", PineArray())
@@ -9211,7 +9285,7 @@ def scan_binance(
                     if isinstance(zone_box, Box) and zone_box.bottom <= close_price <= zone_box.top:
                         retrace_match = True
                 if not retrace_match:
-                    for zone_key in ("IDM_OB", "EXT_OB"):
+                    for zone_key in ("IDM_OB", "EXT_OB", "HIST_IDM_OB", "HIST_EXT_OB", "GOLDEN_ZONE"):
                         zone_payload = latest_events.get(zone_key)
                         if isinstance(zone_payload, dict) and _price_in_range(close_price, zone_payload):
                             retrace_match = True
@@ -9220,6 +9294,11 @@ def scan_binance(
                     fvg_payload = latest_events.get("FVG")
                     if isinstance(fvg_payload, dict) and _price_in_range(close_price, fvg_payload):
                         retrace_match = True
+
+            if not math.isnan(close_price):
+                retrace_matches = _collect_choch_retrace_matches(close_price, latest_events)
+                if retrace_matches:
+                    retrace_match = True
 
             if SCAN_REQUIRE_SIGNAL_FILTER and not (liquidity_structure_match or retrace_match):
                 if tracer and tracer.enabled:
@@ -9236,15 +9315,44 @@ def scan_binance(
                     )
                 return idx, None, None
 
+            choch_payload = latest_events.get("CHOCH")
+            has_choch = isinstance(choch_payload, dict)
+            if SCAN_REQUIRE_CHOCH_RETRACE and has_choch and not retrace_matches:
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_choch_retrace",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        retrace_matches=retrace_matches,
+                    )
+                return idx, None, None
+
+            if not has_choch and not liquidity_fvg_match:
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_no_choch_or_liquidity_fvg",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                    )
+                return idx, None, None
+
             # اطبع أحدث الأحداث فقط (آخر شموع ضمن النافذة) مثل سكربت FINAL_liqui
             try:
                 trigger_lines = _emit_recent_events(symbol, timeframe, latest_events, recent_hits)
             except Exception:
                 trigger_lines = []
-            if trigger_lines:
+            if trigger_lines or retrace_matches or liquidity_fvg_match:
                 print(f"\n{_format_symbol(symbol)} ({timeframe})", flush=True)
                 for _ln in trigger_lines:
                     print(_ln, flush=True)
+                if retrace_matches:
+                    print(f"تصحيح السعر بعد CHOCH: {', '.join(dict.fromkeys(retrace_matches))}", flush=True)
+                if liquidity_fvg_match:
+                    print("بديل الإشارة: لمس سيولة ثم تراجع وترك FVG", flush=True)
                 _save_event_seen_cache()
 
             metrics["daily_change_percent"] = daily_change
