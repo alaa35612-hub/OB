@@ -18,6 +18,12 @@ except Exception:  # pragma: no cover
 
 import numpy as np
 
+ANSI_RESET = "\033[0m"
+ANSI_BLUE = "\033[94m"
+ANSI_GREEN = "\033[92m"
+ANSI_YELLOW = "\033[93m"
+ANSI_RED = "\033[91m"
+
 
 DEFAULT_CONFIG: Dict[str, object] = {
     "timeframe": "15m",
@@ -37,6 +43,8 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "print_touched": True,
     "print_created": True,
     "print_broken": True,
+    "print_near": True,
+    "near_zone_pct": 0.20,
     # NEW: daily rise filter (symbol-level pre-filter)
     "min_daily_rise_pct": 0.0,
     # Performance/safety tuning
@@ -58,6 +66,7 @@ class BoxLevel:
     created_ts: int
     strength_pct: float
     touched_reported: bool = False
+    near_reported: bool = False
 
 
 @dataclass
@@ -72,7 +81,7 @@ class Signal:
 @dataclass
 class ZoneEvent:
     symbol: str
-    kind: str  # zone_created / zone_touched / zone_broken
+    kind: str  # zone_created / zone_touched / zone_broken / zone_near
     side: str  # bull / bear
     ts: int
     price: float
@@ -130,6 +139,26 @@ def _daily_rise_pct_from_ohlcv(ohlcv: List[List[float]], timeframe: str) -> Opti
     return (now_close - old_close) / old_close * 100.0
 
 
+def _distance_to_zone_pct(price: float, bottom: float, top: float) -> float:
+    if bottom <= price <= top:
+        return 0.0
+    if price < bottom:
+        return ((bottom - price) / bottom) * 100.0 if bottom else float("inf")
+    return ((price - top) / top) * 100.0 if top else float("inf")
+
+
+def _event_color(kind: str) -> str:
+    if kind == "zone_touched":
+        return ANSI_BLUE
+    if kind == "zone_created":
+        return ANSI_GREEN
+    if kind == "zone_broken":
+        return ANSI_YELLOW
+    if kind == "zone_near":
+        return ANSI_RED
+    return ANSI_RESET
+
+
 def _process_bull_boxes_like_pine(
     levels: List[BoxLevel],
     i: int,
@@ -142,6 +171,7 @@ def _process_bull_boxes_like_pine(
     ts: np.ndarray,
     signals: List[Signal],
     events: List[ZoneEvent],
+    near_zone_pct: float,
 ) -> None:
     idx = 0
     while idx < len(levels):
@@ -152,6 +182,14 @@ def _process_bull_boxes_like_pine(
             box.touched_reported = True
             events.append(
                 ZoneEvent(symbol, "zone_touched", "bull", int(ts[i]), float(low[i]), f"Bull zone touched [{box.bottom:.6f}, {box.top:.6f}]")
+            )
+
+        close_i = float((high[i] + low[i]) / 2.0)
+        near_pct = _distance_to_zone_pct(close_i, box.bottom, box.top)
+        if (not box.touched_reported) and (not box.near_reported) and (near_pct > 0.0) and (near_pct <= near_zone_pct):
+            box.near_reported = True
+            events.append(
+                ZoneEvent(symbol, "zone_near", "bull", int(ts[i]), close_i, f"Bull near zone ({near_pct:.3f}% <= {near_zone_pct:.3f}%) [{box.bottom:.6f}, {box.top:.6f}]")
             )
 
         if high[i] < box.bottom:
@@ -194,6 +232,7 @@ def _process_bear_boxes_like_pine(
     ts: np.ndarray,
     signals: List[Signal],
     events: List[ZoneEvent],
+    near_zone_pct: float,
 ) -> None:
     idx = 0
     while idx < len(levels):
@@ -204,6 +243,14 @@ def _process_bear_boxes_like_pine(
             box.touched_reported = True
             events.append(
                 ZoneEvent(symbol, "zone_touched", "bear", int(ts[i]), float(high[i]), f"Bear zone touched [{box.bottom:.6f}, {box.top:.6f}]")
+            )
+
+        close_i = float((high[i] + low[i]) / 2.0)
+        near_pct = _distance_to_zone_pct(close_i, box.bottom, box.top)
+        if (not box.touched_reported) and (not box.near_reported) and (near_pct > 0.0) and (near_pct <= near_zone_pct):
+            box.near_reported = True
+            events.append(
+                ZoneEvent(symbol, "zone_near", "bear", int(ts[i]), close_i, f"Bear near zone ({near_pct:.3f}% <= {near_zone_pct:.3f}%) [{box.bottom:.6f}, {box.top:.6f}]")
             )
 
         if low[i] > box.top:
@@ -331,6 +378,7 @@ def analyze_symbol(symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]
             ts=ts,
             signals=signals,
             events=events,
+            near_zone_pct=float(cfg.get("near_zone_pct", 0.2)),
         )
         _process_bear_boxes_like_pine(
             levels=boxes_bear,
@@ -344,6 +392,7 @@ def analyze_symbol(symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]
             ts=ts,
             signals=signals,
             events=events,
+            near_zone_pct=float(cfg.get("near_zone_pct", 0.2)),
         )
 
         box_amount = int(cfg["box_amount"])
@@ -430,6 +479,23 @@ def fmt_ts(ms: int) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms / 1000))
 
 
+def _print_event_line(event: ZoneEvent) -> None:
+    color = _event_color(event.kind)
+    print(f"{color}[EVT {fmt_ts(event.ts)}] {event.symbol:18s} {event.kind:12s} {event.side:4s} price={event.price:.6f} | {event.info}{ANSI_RESET}")
+
+
+def _should_print_event(event: ZoneEvent, config: Dict[str, object]) -> bool:
+    if event.kind == "zone_touched":
+        return bool(config.get("print_touched", True))
+    if event.kind == "zone_created":
+        return bool(config.get("print_created", True))
+    if event.kind == "zone_broken":
+        return bool(config.get("print_broken", True))
+    if event.kind == "zone_near":
+        return bool(config.get("print_near", True))
+    return True
+
+
 def run_scan(config: Dict[str, object], once: bool = False) -> None:
     ex = make_exchange(rate_limit=bool(config["rate_limit"]))
     symbols = get_usdt_perp_symbols(ex)
@@ -493,8 +559,13 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
                     continue
                 if sigs:
                     all_signals.extend(sigs)
+                    for s in sigs:
+                        print(f"[SIG {fmt_ts(s.ts)}] {s.symbol:18s} {s.kind:10s} price={s.price:.6f} | {s.info}")
                 if events:
                     all_events.extend(events)
+                    for e in events:
+                        if _should_print_event(e, config):
+                            _print_event_line(e)
 
         all_signals.sort(key=lambda s: s.ts, reverse=True)
         all_events.sort(key=lambda e: e.ts, reverse=True)
@@ -507,34 +578,8 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
 
         if not all_signals:
             print("No signals.")
-        else:
-            for s in all_signals[:50]:
-                print(f"[SIG {fmt_ts(s.ts)}] {s.symbol:18s} {s.kind:10s} price={s.price:.6f} | {s.info}")
-
-        filtered_events = []
-        for e in all_events:
-            if e.kind == "zone_touched" and not bool(config.get("print_touched", True)):
-                continue
-            if e.kind == "zone_created" and not bool(config.get("print_created", True)):
-                continue
-            if e.kind == "zone_broken" and not bool(config.get("print_broken", True)):
-                continue
-            filtered_events.append(e)
-
-        if not filtered_events:
+        if not all_events:
             print("No zone events.")
-        else:
-            touched_symbols = sorted({e.symbol for e in filtered_events if e.kind == "zone_touched"})
-            created_symbols = sorted({e.symbol for e in filtered_events if e.kind == "zone_created"})
-            broken_symbols = sorted({e.symbol for e in filtered_events if e.kind == "zone_broken"})
-
-            print(f"Touched symbols ({len(touched_symbols)}): {', '.join(touched_symbols[:30]) if touched_symbols else '-'}")
-            print(f"Created symbols ({len(created_symbols)}): {', '.join(created_symbols[:30]) if created_symbols else '-'}")
-            print(f"Broken symbols  ({len(broken_symbols)}): {', '.join(broken_symbols[:30]) if broken_symbols else '-'}")
-
-            for e in filtered_events[:80]:
-                print(f"[EVT {fmt_ts(e.ts)}] {e.symbol:18s} {e.kind:12s} {e.side:4s} price={e.price:.6f} | {e.info}")
-
         print("=" * 100 + "\n")
         if once:
             break
